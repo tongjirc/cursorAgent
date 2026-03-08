@@ -1,0 +1,46 @@
+{
+  "failure_handlers": {
+    "cherry_pick_conflict": {
+      "action": "analyze_conflict_files",
+      "output": "列出冲突文件、冲突代码片段，建议手动解决步骤（如保留哪部分代码）",
+      "steps": [
+        "1. 执行 git status 查看冲突文件",
+        "2. 执行 git diff --name-only --diff-filter=U 列出所有冲突文件",
+        "3. 对每个冲突文件，分析<<<<<<< HEAD、=======、>>>>>>> 的差异",
+        "4. 给出具体的冲突解决建议"
+      ]
+    },
+    "test_failure": {
+      "action": "parse_test_report",
+      "output": "定位失败测试用例、错误堆栈，建议修复方向（如断言调整、依赖补充）",
+      "steps": [
+        "1. 读取测试输出日志",
+        "2. 定位失败测试用例的文件和行号",
+        "3. 分析错误堆栈，找出根本原因",
+        "4. 给出具体的修复建议"
+      ]
+    },
+    "invalid_commit": {
+      "action": "validate_commit_id",
+      "output": "验证Commit ID是否存在，若不存在返回错误提示"
+    },
+    "branch_not_exists": {
+      "action": "check_branch_exists",
+      "output": "验证目标分支是否存在，若不存在返回错误提示"
+    }
+  },
+  "cherry_pick_workflow": {
+    "step_1": "git checkout <target-branch>",
+    "step_2": "git cherry-pick <commit-id> --no-commit",
+    "step_3": "运行测试命令 (npm test / pytest / make test)",
+    "step_4": "如果测试通过: git commit && git push origin <target-branch>",
+    "step_5": "如果测试失败: git cherry-pick --abort && 返回失败信息"
+  },
+  "slack_feedback_format": {
+    "success": "✅ Commit `{commit_id}` 已成功Cherry-Pick至`{branch}`分支！\n📊 测试结果：{test_result}\n🔗 推送状态：{push_status}",
+    "conflict": "❌ Cherry-Pick失败（冲突）\n📂 冲突文件：`{conflict_files}`\n⚠️ 差异点：{diff_summary}\n💡 建议：{suggestions}",
+    "test_failed": "❌ 测试失败（Commit `{commit_id}`）\n🧪 失败用例：`{failed_test}`\n⚠️ 错误原因：{error_reason}\n💡 建议：{fix_suggestions}",
+    "invalid_commit": "❌ 无效的Commit ID：`{commit_id}`\n请检查Commit ID是否正确后重试。",
+    "branch_not_found": "❌ 分支不存在：`{branch}`\n请检查目标分支名称是否正确。"
+  }
+}

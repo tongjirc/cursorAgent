@@ -1,0 +1,50 @@
+{
+  "allowed_commands": [
+    "git checkout <branch>",
+    "git cherry-pick <commit-id>",
+    "git cherry-pick <commit-id> --no-commit",
+    "git cherry-pick --abort",
+    "git cherry-pick --continue",
+    "git add <file>",
+    "git add -A",
+    "git commit -m \"<message>\"",
+    "git push origin <branch>",
+    "git status",
+    "git diff",
+    "git diff --name-only --diff-filter=U",
+    "git log --oneline -n 5",
+    "git rev-parse <commit-id>",
+    "git branch -a",
+    "git fetch --all"
+  ],
+  "blocked_commands": [
+    "git reset --hard",
+    "git reset --hard HEAD^",
+    "git clean -fd",
+    "git clean -fdx",
+    "git push --force",
+    "git push origin --force",
+    "git push -f",
+    "git rebase",
+    "git merge",
+    "git branch -D <branch>",
+    "git branch -d <branch>",
+    "git tag -d <tag>",
+    "git stash pop",
+    "git stash drop"
+  ],
+  "security": {
+    "require_approval_for_push": true,
+    "max_commit_message_length": 500,
+    "allowed_branch_patterns": [
+      "main",
+      "master",
+      "develop",
+      "dev",
+      "release/*",
+      "feature/*",
+      "hotfix/*",
+      "bugfix/*"
+    ]
+  }
+}

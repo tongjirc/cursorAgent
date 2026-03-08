@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 配置文件 (敏感信息)
+config/settings.py
+config/*.pyc
+
+# 数据文件 (可选，看需求)
+*.csv
+*.parquet
+*.h5
+*.pkl
+data/
+portfolio/
+
+# 日志
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 临时文件
+tmp/
+temp/
+
+# Slack Tokens (敏感)
+.env
+.env.local
+.env
