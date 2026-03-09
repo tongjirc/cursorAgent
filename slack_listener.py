@@ -120,9 +120,9 @@ def run_cherry_pick(commit_id, target_branch):
     """执行单个 Cherry-Pick"""
     script_path = os.path.join(REPO_PATH, "scripts", "execute_cherry_pick.sh")
 
-    cmd = ["bash", script_path, commit_id, target_branch, REPO_PATH, "python3 -m pytest tests/ -v 2>&1 || true"]
+    cmd = f'bash "{script_path}" "{commit_id}" "{target_branch}" "{REPO_PATH}" "python3 -m pytest tests/ -v 2>&1 || true"'
 
-    print(f"🔧 执行: {' '.join(cmd)}")
+    print(f"🔧 执行: {cmd}")
 
     try:
         result = subprocess.run(
@@ -157,9 +157,9 @@ def run_batch_cherry_pick(commits, target_branch):
     script_path = os.path.join(REPO_PATH, "scripts", "batch_cherry_pick.sh")
 
     commits_str = ",".join(commits)
-    cmd = ["bash", script_path, commits_str, target_branch, REPO_PATH, "python3 -m pytest tests/ -v 2>&1 || true"]
+    cmd = f'bash "{script_path}" "{commits_str}" "{target_branch}" "{REPO_PATH}" "python3 -m pytest tests/ -v 2>&1 || true"'
 
-    print(f"🔧 执行: {' '.join(cmd)}")
+    print(f"🔧 执行: {cmd}")
 
     try:
         result = subprocess.run(
@@ -198,9 +198,9 @@ def run_step_cherry_pick(commits, target_branch):
     script_path = os.path.join(REPO_PATH, "scripts", "step_cherry_pick.sh")
 
     commits_str = ",".join(commits)
-    cmd = ["bash", script_path, commits_str, target_branch, REPO_PATH, "python3 -m pytest tests/ -v 2>&1 || true"]
+    cmd = f'bash "{script_path}" "{commits_str}" "{target_branch}" "{REPO_PATH}" "python3 -m pytest tests/ -v 2>&1 || true"'
 
-    print(f"🔧 执行: {' '.join(cmd)}")
+    print(f"🔧 执行: {cmd}")
 
     try:
         result = subprocess.run(
