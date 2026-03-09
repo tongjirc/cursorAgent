@@ -349,7 +349,7 @@ def handle_mention(event, say, logger):
         return
 
     # Cherry-Pick 命令
-    if "!cherry-pick" in clean_text:
+    if "cherry-pick" in clean_text:
         parts = clean_text.split()
         if len(parts) >= 3:
             commit_id = parts[1]
@@ -369,12 +369,12 @@ def handle_mention(event, say, logger):
             if not processing:
                 process_queue()
         else:
-            say("❌ 格式: `!cherry-pick <commit> <branch>`", thread_ts=ts)
+            say("❌ 格式: `cherry-pick <commit> <branch>`", thread_ts=ts)
 
     # 批量 Cherry-Pick 命令
-    elif "!batch-cp" in clean_text or "!step-cp" in clean_text:
-        step_mode = "!step-cp" in clean_text
-        parts = clean_text.replace("!batch-cp", "").replace("!step-cp", "").strip().split()
+    elif "batch-cp" in clean_text or "step-cp" in clean_text:
+        step_mode = "step-cp" in clean_text
+        parts = clean_text.replace("batch-cp", "").replace("step-cp", "").strip().split()
 
         if len(parts) >= 2:
             commits_str = parts[0]
@@ -384,7 +384,7 @@ def handle_mention(event, say, logger):
             commits = [c.strip() for c in commits_str.split(",") if c.strip()]
 
             if len(commits) < 2:
-                say("❌ 请输入多个 commit，用逗号分隔\n格式: `!batch-cp <c1,c2,c3> <branch>`", thread_ts=ts)
+                say("❌ 请输入多个 commit，用逗号分隔\n格式: `batch-cp <c1,c2,c3> <branch>`", thread_ts=ts)
                 return
 
             mode = "👣 Step-by-Step" if step_mode else "📦 Batch"
@@ -435,7 +435,7 @@ def handle_mention(event, say, logger):
                     say(f"❌ **失败:**\n\n```\n{result['output'][-500:]}\n```", thread_ts=ts)
 
         else:
-            say("❌ 格式: `!batch-cp <c1,c2,c3> <branch>`\n或: `!step-cp <c1,c2,c3> <branch>`", thread_ts=ts)
+            say("❌ 格式: `batch-cp <c1,c2,c3> <branch>`\n或: `step-cp <c1,c2,c3> <branch>`", thread_ts=ts)
 
 if __name__ == "__main__":
     if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:

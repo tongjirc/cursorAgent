@@ -6,9 +6,9 @@
 
 | 命令 | 说明 | 失败处理 |
 |------|------|----------|
-| `!cherry-pick <commit> <branch>` | 单个 Cherry-Pick | 失败回滚 + AI 分析 |
-| `!batch-cp <c1,c2,c3> <branch>` | 批量模式：一起 CP 一起测试 | 失败全部回滚 + AI 汇报 |
-| `!step-cp <c1,c2,c3> <branch>` | 逐个模式：逐个 CP + 测试，失败继续下一个 | 失败回滚当前，继续下一个 |
+| `cherry-pick <commit> <branch>` | 单个 Cherry-Pick | 失败回滚 + AI 分析 |
+| `batch-cp <c1,c2,c3> <branch>` | 批量模式：一起 CP 一起测试 | 失败全部回滚 + AI 汇报 |
+| `step-cp <c1,c2,c3> <branch>` | 逐个模式：逐个 CP + 测试，失败继续下一个 | 失败回滚当前，继续下一个 |
 
 ---
 
@@ -78,12 +78,12 @@ REPO_PATH=/Users/alvinchen/Documents/develop/cursorAgent
 
 ### 单个 Cherry-Pick
 ```
-@Bot !cherry-pick abc1234 main
+@Bot cherry-pick abc1234 main
 ```
 
 ### Batch 模式（一起 CP 一起测试）
 ```
-@Bot !batch-cp abc123,def456,ghi789 main
+@Bot batch-cp abc123,def456,ghi789 main
 ```
 - 一次性 Cherry-Pick 所有 commits
 - 一起运行测试
@@ -91,7 +91,7 @@ REPO_PATH=/Users/alvinchen/Documents/develop/cursorAgent
 
 ### Step 模式（逐个 CP 逐个测试）
 ```
-@Bot !step-cp abc123,def456,ghi789 main
+@Bot step-cp abc123,def456,ghi789 main
 ```
 - 逐个 Cherry-Pick + 测试
 - 失败/冲突 → 回滚当前 commit，继续下一个
@@ -180,14 +180,14 @@ cursorAgent/
 
 | 场景 | 命令 | 预期结果 |
 |------|------|----------|
-| 单个 CP 成功 | `!cherry-pick <commit> main` | 成功提交推送 |
-| 单个 CP 冲突 | `!cherry-pick <conflict_commit> main` | 回滚，报告冲突 |
-| 单个 CP 测试失败 | `!cherry-pick <fail_commit> main` | 回滚，AI 分析 |
-| Batch 全部成功 | `!batch-cp <c1>,<c2> main` | 全部提交推送 |
-| Batch 失败 | `!batch-cp <c1>,<c2> main` | 全部回滚，AI 汇报 |
-| Step 全部成功 | `!step-cp <c1>,<c2> main` | 逐个通过，最终成功 |
-| Step 部分失败 | `!step-cp <ok>,<fail> main` | ok通过，fail回滚，继续 |
-| Step 冲突 | `!step-cp <ok>,<conflict> main` | ok通过，conflict回滚，继续 |
+| 单个 CP 成功 | `cherry-pick <commit> main` | 成功提交推送 |
+| 单个 CP 冲突 | `cherry-pick <conflict_commit> main` | 回滚，报告冲突 |
+| 单个 CP 测试失败 | `cherry-pick <fail_commit> main` | 回滚，AI 分析 |
+| Batch 全部成功 | `batch-cp <c1>,<c2> main` | 全部提交推送 |
+| Batch 失败 | `batch-cp <c1>,<c2> main` | 全部回滚，AI 汇报 |
+| Step 全部成功 | `step-cp <c1>,<c2> main` | 逐个通过，最终成功 |
+| Step 部分失败 | `step-cp <ok>,<fail> main` | ok通过，fail回滚，继续 |
+| Step 冲突 | `step-cp <ok>,<conflict> main` | ok通过，conflict回滚，继续 |
 
 ## ⚙️ 配置
 
@@ -222,6 +222,106 @@ bash scripts/step_cherry_pick.sh "<c1,c2>" <branch> <repo> "python -m pytest"
 
 ### 测试失败
 - 手动运行测试：`python3 -m pytest tests/ -v`
+
+---
+
+## 📝 测试文件说明
+
+### 测试文件位置
+```
+cursorAgent/
+├── test_pass.py   # 会通过的测试（用于成功场景）
+├── test_fail.py  # 会失败的测试（用于失败场景）
+└── tests/
+    └── test_basic.py  # 基础测试（pytest 运行）
+```
+
+### 修改测试
+- 编辑 `test_fail.py` 或 `test_pass.py` 来模拟不同场景
+- 或在 Slack 命令中指定自定义测试命令
+
+---
+
+## 🤖 AI 分析与提示词修改
+
+### AI 分析位置
+AI 分析功能在 `slack_listener.py` 文件中，函数如下：
+
+```python
+# 第 57-77 行：AI 分析主函数
+def analyze_with_ai(prompt):
+    """使用 AI 分析并返回建议"""
+    # 调用 agent CLI 执行分析
+    result = subprocess.run(
+        ["agent", "-p", "-f", prompt],
+        ...
+    )
+
+# 第 80-88 行：冲突分析
+def analyze_conflict(conflict_files, conflict_details):
+    prompt = f"""分析以下 Git 冲突，给出具体解决建议:
+冲突文件: {conflict_files}
+请简洁回答:
+1. 冲突原因 (1句话)
+2. 推荐解决方案 (2-3步)"""
+
+# 第 90-101 行：测试失败分析
+def analyze_test_failure(test_output):
+    prompt = f"""分析以下测试失败，给出修复建议:
+测试输出: {test_output[:2000]}
+请简洁回答:
+1. 失败原因 (1句话)
+修复步骤 (2-3步)"""
+
+# 第 103-117 行：批量失败分析
+def analyze_batch_failure(failed_commit, test_output):
+    prompt = f"""分析以下 Git commit 的改动，找出导致测试失败的原因:
+失败的 Commit: {failed_commit}
+测试输出: {test_output[:2000]}
+请简洁回答:
+1. 这个 commit 做了什么改动?
+2. 可能导致测试失败的原因 (1-2句话)
+3. 推荐修复方案"""
+```
+
+### 如何修改 AI 提示词
+
+1. **打开 slack_listener.py**
+   ```bash
+   vim ~/Documents/develop/cursorAgent/slack_listener.py
+   ```
+
+2. **找到对应的函数**（行号如上所示）
+
+3. **修改 prompt 变量中的内容**
+   - `analyze_conflict`: 修改冲突分析的提示词
+   - `analyze_test_failure`: 修改测试失败分析的提示词
+   - `analyze_batch_failure`: 修改批量失败分析的提示词
+
+4. **保存并重启 Bot**
+   ```bash
+   # 重启 Bot
+   python3 slack_listener.py
+   ```
+
+### 提示词修改示例
+
+```python
+# 原提示词
+prompt = f"""分析以下测试失败，给出修复建议:
+测试输出: {test_output[:2000]}
+请简洁回答:
+1. 失败原因 (1句话)
+修复步骤 (2-3步)"""
+
+# 修改后（更详细）
+prompt = f"""你是 Git 专家。分析以下 pytest 测试失败:
+测试输出: {test_output[:2000]}
+请给出:
+1. 失败的测试函数名
+2. 失败原因（Python 错误类型）
+3. 精确的修复代码（如果能确定）"""
+```
 
 ---
 
