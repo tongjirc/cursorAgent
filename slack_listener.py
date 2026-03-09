@@ -134,7 +134,8 @@ def run_cherry_pick(commit_id, target_branch):
             shell=True
         )
 
-        output = result.stdout + "\n" + result.stderr
+        output = result.stdout + "
+" + result.stderr
 
         return {
             "success": result.returncode == 0,
@@ -171,7 +172,8 @@ def run_batch_cherry_pick(commits, target_branch):
             shell=True
         )
 
-        output = result.stdout + "\n" + result.stderr
+        output = result.stdout + "
+" + result.stderr
 
         return {
             "success": result.returncode == 0,
@@ -212,7 +214,8 @@ def run_step_cherry_pick(commits, target_branch):
             shell=True
         )
 
-        output = result.stdout + "\n" + result.stderr
+        output = result.stdout + "
+" + result.stderr
 
         return {
             "success": "STEP_SUCCESS" in output,
@@ -237,7 +240,8 @@ def run_step_cherry_pick(commits, target_branch):
 def extract_commits(output, prefix):
     """从输出中提取 commits 列表"""
     import re
-    match = re.search(rf'{prefix}([^\n]+)', output)
+    match = re.search(rf'{prefix}([^
+]+)', output)
     if match:
         return [c.strip() for c in match.group(1).split(",") if c.strip()]
     return []
@@ -263,11 +267,16 @@ def process_queue():
         result = run_cherry_pick(commit_id, target_branch)
 
         if result["success"]:
-            say(f"✅ **Cherry-Pick 成功!**\n\n```\n{result['output'][-500:]}\n```", thread_ts=ts)
+            say(f"✅ **Cherry-Pick 成功!**
+
+```
+{result['output'][-500:]}
+```", thread_ts=ts)
 
         elif result["is_conflict"]:
             conflict_files = "未知"
-            for line in result["output"].split("\n"):
+            for line in result["output"].split("
+"):
                 if ".js" in line or ".py" in line:
                     conflict_files = line.strip()
 
@@ -285,11 +294,17 @@ def process_queue():
                     "suggestion": ai_suggestion
                 }
 
-                say(f"🤖 **AI 建议:**\n\n{ai_suggestion[:1000]}\n\n"
+                say(f"🤖 **AI 建议:**
+
+{ai_suggestion[:1000]}
+
+"
                     f"是否接受建议并继续? 回复 `yes` 或 `no`",
                     thread_ts=ts)
             else:
-                say(f"📂 **冲突文件:** `{conflict_files}`\n\n"
+                say(f"📂 **冲突文件:** `{conflict_files}`
+
+"
                     f"请手动解决后重试", thread_ts=ts)
 
         elif result["is_test_fail"]:
@@ -305,15 +320,27 @@ def process_queue():
                     "suggestion": ai_suggestion
                 }
 
-                say(f"🤖 **AI 建议:**\n\n{ai_suggestion[:1000]}\n\n"
+                say(f"🤖 **AI 建议:**
+
+{ai_suggestion[:1000]}
+
+"
                     f"是否接受建议并继续? 回复 `yes` 或 `no`",
                     thread_ts=ts)
             else:
-                say(f"🧪 **测试失败**\n\n```\n{result['output'][-500:]}\n```",
+                say(f"🧪 **测试失败**
+
+```
+{result['output'][-500:]}
+```",
                     thread_ts=ts)
 
         else:
-            say(f"❌ **失败:**\n\n```\n{result['output'][-500:]}\n```", thread_ts=ts)
+            say(f"❌ **失败:**
+
+```
+{result['output'][-500:]}
+```", thread_ts=ts)
 
         processing = False
 
@@ -349,7 +376,7 @@ def handle_mention(event, say, logger):
         return
 
     # Cherry-Pick 命令
-    if "!cherry-pick" in clean_text:
+    if "!cherry-pick" in clean_text or "cherry-pick" in clean_text:
         parts = clean_text.split()
         if len(parts) >= 3:
             commit_id = parts[1]
@@ -384,7 +411,8 @@ def handle_mention(event, say, logger):
             commits = [c.strip() for c in commits_str.split(",") if c.strip()]
 
             if len(commits) < 2:
-                say("❌ 请输入多个 commit，用逗号分隔\n格式: `!batch-cp <c1,c2,c3> <branch>`", thread_ts=ts)
+                say("❌ 请输入多个 commit，用逗号分隔
+格式: `!batch-cp <c1,c2,c3> <branch>`", thread_ts=ts)
                 return
 
             mode = "👣 Step-by-Step" if step_mode else "📦 Batch"
@@ -400,42 +428,66 @@ def handle_mention(event, say, logger):
                 conflict = result.get("conflict_commits", [])
                 
                 if result["success"]:
-                    say(f"✅ **全部成功!**\n\n通过: `{', '.join(passed)}`", thread_ts=ts)
+                    say(f"✅ **全部成功!**
+
+通过: `{', '.join(passed)}`", thread_ts=ts)
                 elif result.get("is_partial"):
-                    msg = f"⚠️ **部分成功**\n\n"
+                    msg = f"⚠️ **部分成功**
+
+"
                     if passed:
-                        msg += f"✅ 通过: `{', '.join(passed)}`\n"
+                        msg += f"✅ 通过: `{', '.join(passed)}`
+"
                     if failed:
-                        msg += f"❌ 失败: `{', '.join(failed)}`\n"
+                        msg += f"❌ 失败: `{', '.join(failed)}`
+"
                     if conflict:
-                        msg += f"⚠️ 冲突: `{', '.join(conflict)}`\n"
+                        msg += f"⚠️ 冲突: `{', '.join(conflict)}`
+"
                     say(msg, thread_ts=ts)
                 else:
-                    say(f"❌ **失败**\n\n```\n{result['output'][-500:]}\n```", thread_ts=ts)
+                    say(f"❌ **失败**
+
+```
+{result['output'][-500:]}
+```", thread_ts=ts)
             else:
                 # Batch 模式
                 result = run_batch_cherry_pick(commits, target_branch)
 
                 if result["success"]:
                     passed = result.get("passed_commits", [])
-                    say(f"✅ **Batch Cherry-Pick 成功!**\n\n通过: `{', '.join(passed)}`", thread_ts=ts)
+                    say(f"✅ **Batch Cherry-Pick 成功!**
+
+通过: `{', '.join(passed)}`", thread_ts=ts)
 
                 elif result["is_test_fail"]:
-                    say(f"❌ **测试失败!**\n\n⚠️ 已自动回滚，工作区干净", thread_ts=ts)
+                    say(f"❌ **测试失败!**
+
+⚠️ 已自动回滚，工作区干净", thread_ts=ts)
                     
                     # AI 分析
                     ai_suggestion = analyze_batch_failure(commits[0] if commits else "", result["output"])
                     if ai_suggestion:
-                        say(f"🤖 **AI 分析:**\n\n{ai_suggestion[:1500]}", thread_ts=ts)
+                        say(f"🤖 **AI 分析:**
+
+{ai_suggestion[:1500]}", thread_ts=ts)
 
                 elif result["is_conflict"]:
-                    say("⚠️ **冲突!**\n\n请手动解决后重试", thread_ts=ts)
+                    say("⚠️ **冲突!**
+
+请手动解决后重试", thread_ts=ts)
 
                 else:
-                    say(f"❌ **失败:**\n\n```\n{result['output'][-500:]}\n```", thread_ts=ts)
+                    say(f"❌ **失败:**
+
+```
+{result['output'][-500:]}
+```", thread_ts=ts)
 
         else:
-            say("❌ 格式: `!batch-cp <c1,c2,c3> <branch>`\n或: `!step-cp <c1,c2,c3> <branch>`", thread_ts=ts)
+            say("❌ 格式: `!batch-cp <c1,c2,c3> <branch>`
+或: `!step-cp <c1,c2,c3> <branch>`", thread_ts=ts)
 
 if __name__ == "__main__":
     if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
