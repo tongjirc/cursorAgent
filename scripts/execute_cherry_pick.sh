@@ -80,13 +80,7 @@ echo "📤 [4/4] 提交..."
 git add -A
 git commit -m "Cherry-pick: $COMMIT_ID → $TARGET_BRANCH" 2>/dev/null || true
 
-if git push origin "$TARGET_BRANCH" 2>/dev/null; then
-    echo "✅ 推送成功"
-else
-    echo "⚠️ 推送失败 (本地OK)"
-fi
-
 echo "========================================"
-echo "✅ 完成!"
+echo "✅ Cherry-Pick 完成! (本地已提交)"
 echo "========================================"
 exit 0

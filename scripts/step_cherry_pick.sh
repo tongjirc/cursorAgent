@@ -128,10 +128,7 @@ if [ $TOTAL_PASSED -eq $TOTAL_COMMITS ]; then
     git add -A
     git commit -m "Step cherry-pick: ${PASSED_COMMITS[*]} → $TARGET_BRANCH" 2>/dev/null || true
     
-    if git push origin "$TARGET_BRANCH" 2>/dev/null; then
-        echo "✅ 推送成功"
     else
-        echo "⚠️ 推送失败 (本地OK)"
     fi
     
     echo "STEP_SUCCESS"
@@ -153,10 +150,7 @@ else
         git add -A
         git commit -m "Step cherry-pick (partial): ${PASSED_COMMITS[*]} → $TARGET_BRANCH" 2>/dev/null || true
         
-        if git push origin "$TARGET_BRANCH" 2>/dev/null; then
-            echo "✅ 推送成功"
         else
-            echo "⚠️ 推送失败 (本地OK)"
         fi
     fi
     
