@@ -134,8 +134,7 @@ def run_cherry_pick(commit_id, target_branch):
             shell=True
         )
 
-        output = result.stdout + "
-" + result.stderr
+        output = result.stdout + " " + result.stderr
 
         return {
             "success": result.returncode == 0,
@@ -172,8 +171,7 @@ def run_batch_cherry_pick(commits, target_branch):
             shell=True
         )
 
-        output = result.stdout + "
-" + result.stderr
+        output = result.stdout + " " + result.stderr
 
         return {
             "success": result.returncode == 0,
@@ -214,8 +212,7 @@ def run_step_cherry_pick(commits, target_branch):
             shell=True
         )
 
-        output = result.stdout + "
-" + result.stderr
+        output = result.stdout + " " + result.stderr
 
         return {
             "success": "STEP_SUCCESS" in output,
@@ -275,8 +272,7 @@ def process_queue():
 
         elif result["is_conflict"]:
             conflict_files = "未知"
-            for line in result["output"].split("
-"):
+            for line in result["output"].split(" "):
                 if ".js" in line or ".py" in line:
                     conflict_files = line.strip()
 
