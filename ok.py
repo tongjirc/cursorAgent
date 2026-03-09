@@ -1,1 +1,1 @@
-print('test passed')
+print('ok')
