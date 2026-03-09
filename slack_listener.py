@@ -129,7 +129,7 @@ def run_cherry_pick(commit_id, target_branch):
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=30,
             cwd=REPO_PATH,
             shell=True
         )
@@ -166,7 +166,7 @@ def run_batch_cherry_pick(commits, target_branch):
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=30,
             cwd=REPO_PATH,
             shell=True
         )
