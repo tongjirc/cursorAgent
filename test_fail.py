@@ -1,1 +1,1 @@
-assert False, 'test will fail'
+assert False, 'fail'
