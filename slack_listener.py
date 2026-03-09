@@ -371,10 +371,10 @@ def handle_mention(event, say, logger):
         else:
             say("❌ 格式: `!cherry-pick <commit> <branch>`", thread_ts=ts)
 
-    # 批量 Cherry-Pick 命令
-    elif "!batch-cp" in clean_text or "!step-cp" in clean_text:
-        step_mode = "!step-cp" in clean_text
-        parts = clean_text.replace("!batch-cp", "").replace("!step-cp", "").strip().split()
+    # 批量 Cherry-Pick 命令 (支持 !batch-cp, batch-cp, !step-cp, step-cp)
+    elif "!batch-cp" in clean_text or "batch-cp" in clean_text or "!step-cp" in clean_text or "step-cp" in clean_text:
+        step_mode = "!step-cp" in clean_text or "step-cp" in clean_text
+        parts = clean_text.replace("!batch-cp", "").replace("batch-cp", "").replace("!step-cp", "").replace("step-cp", "").strip().split()
 
         if len(parts) >= 2:
             commits_str = parts[0]
