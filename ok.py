@@ -1,1 +1,1 @@
-print('test passed')
+# OK test
