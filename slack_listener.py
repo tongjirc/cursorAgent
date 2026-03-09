@@ -136,7 +136,7 @@ def run_cherry_pick(commit_id, target_branch):
 
     cmd = (
         'bash "{script}" "{commit}" "{branch}" "{repo}" '
-        '"python3 -m pytest tests/ -v 2>&1 || true"'
+        '"python3 -m pytest tests/ -v 2>&1"'
     ).format(
         script=script_path,
         commit=commit_id,
@@ -157,12 +157,20 @@ def run_cherry_pick(commit_id, target_branch):
         )
         output = (result.stdout or "") + "\n" + (result.stderr or "")
 
+        is_conflict = ("CONFLICT" in output) or ("conflict" in output.lower())
+        is_test_fail = ("TEST_FAIL" in output) or ("FAILED" in output) or (
+            "fail" in output.lower()
+        )
+        is_no_change = "NO_CHANGE" in output
+
         return {
-            "success": result.returncode == 0,
+            # 成功 = 命令成功且不是 no-op
+            "success": (result.returncode == 0) and (not is_no_change),
             "output": output,
             "returncode": result.returncode,
-            "is_conflict": ("CONFLICT" in output) or ("conflict" in output.lower()),
-            "is_test_fail": ("FAILED" in output) or ("fail" in output.lower()),
+            "is_conflict": is_conflict,
+            "is_test_fail": is_test_fail,
+            "is_no_change": is_no_change,
         }
     except Exception as e:
         return {
@@ -171,6 +179,7 @@ def run_cherry_pick(commit_id, target_branch):
             "returncode": -1,
             "is_conflict": False,
             "is_test_fail": False,
+            "is_no_change": False,
         }
 
 
@@ -313,13 +322,13 @@ def process_queue():
 
         result = run_cherry_pick(commit_id, target_branch)
 
-        if result["success"]:
+        if result.get("success"):
             msg = "✅ **Cherry-Pick 成功!**\n\n```{}```".format(
                 result["output"][-500:]
             )
             say(msg, thread_ts=ts)
 
-        elif result["is_conflict"]:
+        elif result.get("is_conflict"):
             conflict_files = "未知"
             for line in (result["output"] or "").split("\n"):
                 if (".js" in line) or (".py" in line):
@@ -353,8 +362,13 @@ def process_queue():
                 ).format(files=conflict_files)
                 say(msg, thread_ts=ts)
 
-        elif result["is_test_fail"]:
-            say("⚠️ **Cherry-Pick 失败 - 测试失败**", thread_ts=ts)
+        elif result.get("is_test_fail"):
+            # 先把测试输出贴出来
+            msg = (
+                "⚠️ **Cherry-Pick 失败 - 测试失败**\n\n"
+                "```\n{out}\n```"
+            ).format(out=result["output"][-500:])
+            say(msg, thread_ts=ts)
 
             ai_suggestion = analyze_test_failure(result["output"])
 
@@ -372,12 +386,16 @@ def process_queue():
                     "是否接受建议并继续? 回复 `yes` 或 `no`"
                 ).format(suggest=ai_suggestion[:1000])
                 say(msg, thread_ts=ts)
-            else:
-                msg = (
-                    "🧪 **测试失败**\n\n"
-                    "```\n{out}\n```"
-                ).format(out=result["output"][-500:])
-                say(msg, thread_ts=ts)
+
+        elif result.get("is_no_change"):
+            # 空 cherry-pick：没有任何变更，多半是提交已经在目标分支上
+            msg = (
+                "ℹ️ **Cherry-Pick 未产生变更**\n\n"
+                "这个提交的改动可能已经存在于 `{branch}` 上，或没有文件变更。\n\n"
+                "```\n{out}\n```"
+            ).format(branch=target_branch, out=result["output"][-500:])
+            say(msg, thread_ts=ts)
+
         else:
             msg = (
                 "❌ **失败:**\n\n"
