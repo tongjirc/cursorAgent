@@ -152,10 +152,9 @@ def run_cherry_pick(commit_id, target_branch):
             "is_test_fail": False
         }
 
-def run_batch_cherry_pick(commits, target_branch, smart=False):
-    """执行批量 Cherry-Pick"""
-    script_name = "smart_batch_cherry_pick.sh" if smart else "batch_cherry_pick.sh"
-    script_path = os.path.join(REPO_PATH, "scripts", script_name)
+def run_batch_cherry_pick(commits, target_branch):
+    """执行批量 Cherry-Pick - 一起测试，失败回滚"""
+    script_path = os.path.join(REPO_PATH, "scripts", "batch_cherry_pick.sh")
 
     commits_str = ",".join(commits)
     cmd = ["bash", script_path, commits_str, target_branch, REPO_PATH, "python3 -m pytest tests/ -v 2>&1 || true"]
@@ -180,8 +179,8 @@ def run_batch_cherry_pick(commits, target_branch, smart=False):
             "returncode": result.returncode,
             "is_conflict": "CONFLICT" in output,
             "is_test_fail": "TEST_FAIL" in output,
-            "passed_commits": extract_passed_commits(output),
-            "failed_commit": extract_failed_commit(output)
+            "passed_commits": extract_commits(output, "COMMITS:"),
+            "failed_commit": None
         }
     except Exception as e:
         return {
@@ -194,21 +193,54 @@ def run_batch_cherry_pick(commits, target_branch, smart=False):
             "failed_commit": None
         }
 
-def extract_passed_commits(output):
-    """从输出中提取成功的 commit"""
+def run_step_cherry_pick(commits, target_branch):
+    """执行 Step-by-Step Cherry-Pick - 逐个测试，失败继续下一个"""
+    script_path = os.path.join(REPO_PATH, "scripts", "step_cherry_pick.sh")
+
+    commits_str = ",".join(commits)
+    cmd = ["bash", script_path, commits_str, target_branch, REPO_PATH, "python3 -m pytest tests/ -v 2>&1 || true"]
+
+    print(f"🔧 执行: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            cwd=REPO_PATH,
+            shell=True
+        )
+
+        output = result.stdout + "\n" + result.stderr
+
+        return {
+            "success": "STEP_SUCCESS" in output,
+            "output": output,
+            "returncode": result.returncode,
+            "is_partial": "STEP_PARTIAL" in output,
+            "passed_commits": extract_commits(output, "PASSED:"),
+            "failed_commits": extract_commits(output, "FAILED:"),
+            "conflict_commits": extract_commits(output, "CONFLICT:")
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "output": str(e),
+            "returncode": -1,
+            "is_partial": False,
+            "passed_commits": [],
+            "failed_commits": [],
+            "conflict_commits": []
+        }
+
+def extract_commits(output, prefix):
+    """从输出中提取 commits 列表"""
     import re
-    match = re.search(r'PASSED:([^\n]+)', output)
+    match = re.search(rf'{prefix}([^\n]+)', output)
     if match:
         return [c.strip() for c in match.group(1).split(",") if c.strip()]
     return []
-
-def extract_failed_commit(output):
-    """从输出中提取失败的 commit"""
-    import re
-    match = re.search(r'FAILED:([^\n]+)', output)
-    if match:
-        return match.group(1).strip()
-    return None
 
 def process_queue():
     """处理队列"""
@@ -340,9 +372,9 @@ def handle_mention(event, say, logger):
             say("❌ 格式: `!cherry-pick <commit> <branch>`", thread_ts=ts)
 
     # 批量 Cherry-Pick 命令
-    elif "!batch-cp" in clean_text or "!smart-cp" in clean_text:
-        smart = "!smart-cp" in clean_text
-        parts = clean_text.replace("!batch-cp", "").replace("!smart-cp", "").strip().split()
+    elif "!batch-cp" in clean_text or "!step-cp" in clean_text:
+        step_mode = "!step-cp" in clean_text
+        parts = clean_text.replace("!batch-cp", "").replace("!step-cp", "").strip().split()
 
         if len(parts) >= 2:
             commits_str = parts[0]
@@ -352,41 +384,58 @@ def handle_mention(event, say, logger):
             commits = [c.strip() for c in commits_str.split(",") if c.strip()]
 
             if len(commits) < 2:
-                say("❌ 请输入多个 commit，用逗号分隔\n格式: `!batch-cp <commit1,commit2,commit3> <branch>`", thread_ts=ts)
+                say("❌ 请输入多个 commit，用逗号分隔\n格式: `!batch-cp <c1,c2,c3> <branch>`", thread_ts=ts)
                 return
 
-            mode = "🔍 智能" if smart else "📦 批量"
+            mode = "👣 Step-by-Step" if step_mode else "📦 Batch"
             say(f"{mode} Cherry-Pick: {len(commits)} 个 commits → `{target_branch}`", thread_ts=ts)
             say(f"📋 Commits: `{'`, `'.join(commits)}`", thread_ts=ts)
 
-            result = run_batch_cherry_pick(commits, target_branch, smart=smart)
-
-            if result["success"]:
+            if step_mode:
+                # Step 模式
+                result = run_step_cherry_pick(commits, target_branch)
+                
                 passed = result.get("passed_commits", [])
-                say(f"✅ **批量 Cherry-Pick 成功!**\n\n通过: `{', '.join(passed)}`", thread_ts=ts)
-
-            elif result["is_test_fail"]:
-                failed = result.get("failed_commit")
-                passed = result.get("passed_commits", [])
-
-                say(f"❌ **测试失败!**\n\n通过: `{', '.join(passed)}`\n失败: `{failed}`", thread_ts=ts)
-
-                # AI 分析失败的 commit
-                ai_suggestion = analyze_batch_failure(failed, result["output"])
-
-                if ai_suggestion:
-                    say(f"🤖 **AI 分析:**\n\n{ai_suggestion[:1500]}", thread_ts=ts)
-
-                say(f"⚠️ 已自动回滚，工作区干净", thread_ts=ts)
-
-            elif result["is_conflict"]:
-                say("⚠️ **冲突!**\n\n请手动解决后重试", thread_ts=ts)
-
+                failed = result.get("failed_commits", [])
+                conflict = result.get("conflict_commits", [])
+                
+                if result["success"]:
+                    say(f"✅ **全部成功!**\n\n通过: `{', '.join(passed)}`", thread_ts=ts)
+                elif result.get("is_partial"):
+                    msg = f"⚠️ **部分成功**\n\n"
+                    if passed:
+                        msg += f"✅ 通过: `{', '.join(passed)}`\n"
+                    if failed:
+                        msg += f"❌ 失败: `{', '.join(failed)}`\n"
+                    if conflict:
+                        msg += f"⚠️ 冲突: `{', '.join(conflict)}`\n"
+                    say(msg, thread_ts=ts)
+                else:
+                    say(f"❌ **失败**\n\n```\n{result['output'][-500:]}\n```", thread_ts=ts)
             else:
-                say(f"❌ **失败:**\n\n```\n{result['output'][-500:]}\n```", thread_ts=ts)
+                # Batch 模式
+                result = run_batch_cherry_pick(commits, target_branch)
+
+                if result["success"]:
+                    passed = result.get("passed_commits", [])
+                    say(f"✅ **Batch Cherry-Pick 成功!**\n\n通过: `{', '.join(passed)}`", thread_ts=ts)
+
+                elif result["is_test_fail"]:
+                    say(f"❌ **测试失败!**\n\n⚠️ 已自动回滚，工作区干净", thread_ts=ts)
+                    
+                    # AI 分析
+                    ai_suggestion = analyze_batch_failure(commits[0] if commits else "", result["output"])
+                    if ai_suggestion:
+                        say(f"🤖 **AI 分析:**\n\n{ai_suggestion[:1500]}", thread_ts=ts)
+
+                elif result["is_conflict"]:
+                    say("⚠️ **冲突!**\n\n请手动解决后重试", thread_ts=ts)
+
+                else:
+                    say(f"❌ **失败:**\n\n```\n{result['output'][-500:]}\n```", thread_ts=ts)
 
         else:
-            say("❌ 格式: `!batch-cp <commit1,commit2,commit3> <branch>`\n或: `!smart-cp <commit1,commit2,commit3> <branch>`", thread_ts=ts)
+            say("❌ 格式: `!batch-cp <c1,c2,c3> <branch>`\n或: `!step-cp <c1,c2,c3> <branch>`", thread_ts=ts)
 
 if __name__ == "__main__":
     if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
