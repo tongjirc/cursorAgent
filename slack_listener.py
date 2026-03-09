@@ -237,8 +237,7 @@ def run_step_cherry_pick(commits, target_branch):
 def extract_commits(output, prefix):
     """从输出中提取 commits 列表"""
     import re
-    match = re.search(rf'{prefix}([^
-]+)', output)
+    match = re.search(rf'{prefix}([^]+)', output)
     if match:
         return [c.strip() for c in match.group(1).split(",") if c.strip()]
     return []
