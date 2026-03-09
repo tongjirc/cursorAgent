@@ -118,7 +118,7 @@ TOTAL_COMMITS=${#COMMITS[@]}
 
 if [ $TOTAL_PASSED -eq $TOTAL_COMMITS ]; then
     echo ""
-    echo "🎉 全部成功! 提交并推送..."
+    echo "🎉 全部成功! 提交..."
     
     # 重新 cherry-pick 全部
     for COMMIT in "${PASSED_COMMITS[@]}"; do
@@ -128,8 +128,7 @@ if [ $TOTAL_PASSED -eq $TOTAL_COMMITS ]; then
     git add -A
     git commit -m "Step cherry-pick: ${PASSED_COMMITS[*]} → $TARGET_BRANCH" 2>/dev/null || true
     
-    else
-    fi
+    echo "✅ 已提交到本地"
     
     echo "STEP_SUCCESS"
     echo "PASSED:${PASSED_COMMITS[*]}"
@@ -150,8 +149,7 @@ else
         git add -A
         git commit -m "Step cherry-pick (partial): ${PASSED_COMMITS[*]} → $TARGET_BRANCH" 2>/dev/null || true
         
-        else
-        fi
+        echo "✅ 已提交到本地"
     fi
     
     cleanup

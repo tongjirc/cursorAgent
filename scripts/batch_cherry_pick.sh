@@ -84,16 +84,12 @@ if [ $TEST_RESULT -eq 0 ]; then
     echo "✅ Batch Cherry-Pick 成功!"
     echo "========================================"
     
-    本地提交
+    # 提交
     echo ""
-    echo "📤 本地提交..."
+    echo "📤 [4/4] 提交..."
     git add -A
     git commit -m "Batch cherry-pick: ${COMMITS[*]} → $TARGET_BRANCH" 2>/dev/null || true
     
-    else
-    fi
-    
-    echo "✅ 已提交到本地"
     echo "SUCCESS"
     echo "COMMITS:${COMMITS[*]}"
     exit 0
