@@ -1,1 +1,1 @@
-# OK test
+print('OK')
