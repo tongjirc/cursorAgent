@@ -437,11 +437,16 @@ def is_gerrit_change_number(ref):
     return bool(ref and ref.isdigit() and 5 <= len(ref) <= 7)
 
 
-def _git_fetch(refspec="", timeout=120):
-    """Fetch from origin. If refspec given, fetch that specific ref."""
-    cmd = ["git", "fetch", "origin"]
+def _git_fetch(refspec="", timeout=180):
+    """
+    Fetch from origin.
+    If refspec given, fetch that specific ref.
+    Otherwise, fetch ALL remote branches (not just tracked ones).
+    """
     if refspec:
-        cmd.append(refspec)
+        cmd = ["git", "fetch", "origin", refspec]
+    else:
+        cmd = ["git", "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*", "--no-tags"]
     try:
         log.info("[FETCH] %s", " ".join(cmd))
         result = subprocess.run(
@@ -1248,12 +1253,39 @@ def _build_task(task_type, commits, target_branch, say, ts, user_id):
 BRANCH_PREFIX = os.environ.get("BRANCH_PREFIX", "sandbox/")
 
 
+def _check_duplicate(task):
+    """Check if the same refs+branch+type combo is already queued or running."""
+    raw_refs = set(task.get("raw_refs", []) + task.get("commits", []))
+    target = task.get("target_branch", "")
+    task_type = task.get("type", "")
+
+    if not raw_refs:
+        return False
+
+    with state_lock:
+        all_tasks = list(pending_tasks)
+        if current_task:
+            all_tasks.append(current_task)
+
+    for t in all_tasks:
+        if t.get("type") != task_type or t.get("target_branch") != target:
+            continue
+        existing_refs = set(t.get("raw_refs", []) + t.get("commits", []))
+        if raw_refs & existing_refs:
+            return True
+    return False
+
+
 def _enqueue(task, say, ts):
     """Enqueue task + update pending_tasks + reply with queue overview."""
     target_branch = task.get("target_branch", "")
     if target_branch and not target_branch.startswith(BRANCH_PREFIX):
         say("❌ Target branch must start with `{}`. Got: `{}`".format(
             BRANCH_PREFIX, target_branch), thread_ts=ts)
+        return
+
+    if _check_duplicate(task):
+        say("⚠️ Duplicate: same refs already in queue or running. Skipped.", thread_ts=ts)
         return
 
     with state_lock:

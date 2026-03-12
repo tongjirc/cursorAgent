@@ -42,6 +42,10 @@ checkout_branch() {
             return 1
         fi
     fi
+    # Pull latest from remote to ensure we're up to date
+    echo "Pulling latest from origin/$branch..."
+    git pull origin "$branch" --ff-only 2>&1 || git reset --hard "origin/$branch" 2>/dev/null || true
+    echo "Branch up to date"
 }
 
 # ---- do_cherry_pick: cherry-pick a single commit, handle conflict ----
