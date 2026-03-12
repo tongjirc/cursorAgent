@@ -37,11 +37,11 @@ env/
 .DS_Store
 Thumbs.db
 
-# 配置文件 (敏感信息)
+# Config (sensitive)
 config/settings.py
 config/*.pyc
 
-# 数据文件 (可选，看需求)
+# Data
 *.csv
 *.parquet
 *.h5
@@ -49,18 +49,18 @@ config/*.pyc
 data/
 portfolio/
 
-# 日志
+# Logs
 *.log
+logs/
 
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
 
-# 临时文件
+# Temp
 tmp/
 temp/
 
-# Slack Tokens (敏感)
+# Sensitive
 .env
 .env.local
-.env

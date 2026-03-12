@@ -1,7 +1,9 @@
 #!/bin/bash
 #
-# Batch Cherry-Pick: cherry-pick all commits -> test once -> push
-# Each commit is an individual cherry-pick (no squash). Failure reverts all.
+# Revert script: revert one or more commits on target branch
+# Single commit: revert -> test -> push
+# Multiple commits: revert each -> test once -> push
+# Reverts on any failure (test/push).
 #
 
 COMMIT_LIST="$1"
@@ -14,7 +16,7 @@ IFS=',' read -ra COMMITS <<< "$COMMIT_LIST"
 source "$(dirname "$0")/cp_common.sh"
 
 echo "========================================"
-echo "Batch Cherry-Pick"
+echo "Revert: ${#COMMITS[@]} commits on $TARGET_BRANCH"
 echo "========================================"
 echo "Commits: ${COMMITS[*]}"
 echo "Target: $TARGET_BRANCH"
@@ -31,20 +33,31 @@ echo "[1/4]"
 checkout_branch "$TARGET_BRANCH" || finish 1
 SAVE_HEAD=$(git rev-parse HEAD)
 
-# 2. Cherry-pick each commit
+# 2. Revert each commit
 echo ""
-echo "[2/4] Cherry-picking ${#COMMITS[@]} commits..."
+echo "[2/4] Reverting ${#COMMITS[@]} commits..."
 
 for i in "${!COMMITS[@]}"; do
     COMMIT="${COMMITS[$i]}"
     COMMIT=$(echo "$COMMIT" | xargs)
 
-    echo "--- Commit $((i+1))/${#COMMITS[@]}: $COMMIT ---"
+    echo "--- Revert $((i+1))/${#COMMITS[@]}: $COMMIT ---"
 
-    do_cherry_pick "$COMMIT" "$SAVE_HEAD"
-    CP_STATUS=$?
+    if git revert --no-edit "$COMMIT" 2>&1; then
+        echo "$COMMIT reverted"
+    else
+        echo "$COMMIT revert CONFLICT!"
+        CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+        echo "Conflict files: $CONFLICT_FILES"
+        echo ""
+        echo "CONFLICT_DIFF_START"
+        git diff 2>/dev/null || true
+        echo "CONFLICT_DIFF_END"
 
-    if [ $CP_STATUS -ne 0 ]; then
+        git revert --abort 2>/dev/null || true
+        git reset --hard "$SAVE_HEAD" 2>/dev/null || true
+        echo "All rolled back"
+
         echo "CONFLICT"
         echo "COMMIT:$COMMIT"
         echo "FILES:$CONFLICT_FILES"
@@ -52,7 +65,7 @@ for i in "${!COMMITS[@]}"; do
     fi
 done
 
-echo "All ${#COMMITS[@]} commits cherry-picked"
+echo "All ${#COMMITS[@]} commits reverted"
 
 # 3. Test
 echo "[3/4]"
@@ -68,7 +81,7 @@ if [ $TEST_RESULT -ne 0 ]; then
 fi
 echo "Tests passed"
 echo "========================================"
-echo "Batch Cherry-Pick succeeded!"
+echo "Revert succeeded!"
 echo "========================================"
 
 # 4. Push

@@ -1,170 +1,125 @@
 #!/bin/bash
 #
-# Step-by-Step Cherry-Pick 脚本
-# 特性：逐个 Cherry-Pick，冲突/失败就回滚当前 commit，继续下一个
-# 最终汇报：哪些成功、哪些失败、哪些冲突
-# 用法: bash step_cherry_pick.sh "<commit1,commit2,commit3>" <target-branch> [repo-path] [test-command]
+# Step-by-Step Cherry-Pick: for each commit -> cherry-pick -> test -> push
+# Failed/conflicted commits are skipped. Push failure reverts that commit.
 #
 
 COMMIT_LIST="$1"
 TARGET_BRANCH="$2"
 REPO_PATH="${3:-.}"
-TEST_COMMAND="${4:-python3 -m pytest tests/ -v 2>&1 || true}"
+TEST_COMMAND="${4:-python3 -m pytest tests/ -v 2>&1}"
 
-# 解析逗号分隔的 commit 列表
 IFS=',' read -ra COMMITS <<< "$COMMIT_LIST"
 
+source "$(dirname "$0")/cp_common.sh"
+
 echo "========================================"
-echo "👣 Step-by-Step Cherry-Pick"
+echo "Step-by-Step Cherry-Pick"
 echo "========================================"
-echo "📋 Commits: ${COMMITS[*]}"
-echo "📌 Target: $TARGET_BRANCH"
-echo "📁 Repo: $REPO_PATH"
-echo "🧪 Test: $TEST_COMMAND"
+echo "Commits: ${COMMITS[*]}"
+echo "Target: $TARGET_BRANCH"
 echo "========================================"
 
-cd "$REPO_PATH"
+cd "$REPO_PATH" || { echo "ERROR: cannot cd to $REPO_PATH"; exit 1; }
+ORIGINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
-# ========== 0. 清理函数 ==========
-cleanup() {
-    git cherry-pick --abort 2>/dev/null || true
-    git checkout -- . 2>/dev/null || true
-    git clean -fd 2>/dev/null || true
-    git reset --hard HEAD 2>/dev/null || true
-}
+# 0. Clean + checkout
+clean_workspace
 
-# ========== 1. 切换分支 ==========
+echo "[1/3]"
+checkout_branch "$TARGET_BRANCH" || finish 1
+
+# 1. Cherry-pick + test + push each commit
 echo ""
-echo "📌 [1/3] 切换到 $TARGET_BRANCH..."
-cleanup
-if git checkout "$TARGET_BRANCH" 2>/dev/null; then
-    echo "✅ 已切换"
-else
-    echo "❌ 分支不存在: $TARGET_BRANCH"
-    exit 1
-fi
-
-# ========== 2. 逐个 Cherry-Pick ==========
-echo ""
-echo "🍒 [2/3] 逐个 Cherry-Pick..."
+echo "[2/3] Cherry-picking commits one by one..."
 
 PASSED_COMMITS=()
 FAILED_COMMITS=()
 CONFLICT_COMMITS=()
+PUSH_FAILED_COMMITS=()
 
 for i in "${!COMMITS[@]}"; do
     COMMIT="${COMMITS[$i]}"
     COMMIT=$(echo "$COMMIT" | xargs)
-    
+
     echo ""
-    echo "--- Commit $((i+1))/${#COMMITS[@]}: $COMMIT ---"
-    
-    # 先清理工作区（每次重新开始）
-    cleanup
-    
-    # Cherry-Pick 当前 commit
-    if ! git cherry-pick "$COMMIT" --no-commit 2>&1; then
-        echo "❌ $COMMIT 冲突! 回滚并继续下一个"
+    echo "========================================"
+    echo "[STEP $((i+1))/${#COMMITS[@]}] Cherry-picking: $COMMIT"
+    echo "========================================"
+
+    BEFORE_HEAD=$(git rev-parse HEAD)
+
+    do_cherry_pick "$COMMIT" "$BEFORE_HEAD"
+    CP_STATUS=$?
+
+    if [ $CP_STATUS -ne 0 ]; then
         CONFLICT_COMMITS+=("$COMMIT")
-        
-        # 回滚当前
-        cleanup
+        echo "Rolling back, continuing to next"
         continue
     fi
-    
-    # 运行测试
-    TEST_OUTPUT=$(eval "$TEST_COMMAND" 2>&1)
-    TEST_RESULT=$?
-    
-    if [ $TEST_RESULT -eq 0 ]; then
-        echo "✅ $COMMIT 测试通过"
-        PASSED_COMMITS+=("$COMMIT")
-        
-        # 回滚当前 commit，继续下一个（不累积）
-        cleanup
-    else
-        echo "❌ $COMMIT 测试失败! 回滚并继续下一个"
+
+    echo "[STEP $((i+1))/${#COMMITS[@]}] Testing: $COMMIT"
+    run_tests "$TEST_COMMAND"
+
+    if [ $TEST_RESULT -ne 0 ]; then
+        echo "$COMMIT tests FAILED! Rolling back, continuing to next"
         FAILED_COMMITS+=("$COMMIT")
-        
-        # 保存失败输出
-        echo "$TEST_OUTPUT" > /tmp/step_fail_$COMMIT.log 2>/dev/null || true
-        
-        # 回滚当前 commit，继续下一个
-        cleanup
+        git reset --hard "$BEFORE_HEAD" 2>/dev/null || true
+        continue
+    fi
+
+    echo "$COMMIT tests passed"
+    echo "[STEP $((i+1))/${#COMMITS[@]}] Pushing: $COMMIT"
+
+    if do_push "$TARGET_BRANCH" "$BEFORE_HEAD"; then
+        echo "$COMMIT pushed successfully"
+        PASSED_COMMITS+=("$COMMIT")
+    else
+        echo "$COMMIT push FAILED, continuing to next"
+        PUSH_FAILED_COMMITS+=("$COMMIT")
     fi
 done
 
-# ========== 3. 汇报结果 ==========
+# 2. Summary
 echo ""
 echo "========================================"
-echo "📊 [3/3] 最终结果"
+echo "[3/3] Summary"
 echo "========================================"
 
-echo "✅ 通过: ${#PASSED_COMMITS[@]} 个"
+echo "Passed + pushed: ${#PASSED_COMMITS[@]}"
 [ ${#PASSED_COMMITS[@]} -gt 0 ] && echo "   ${PASSED_COMMITS[*]}"
 
-echo "❌ 失败: ${#FAILED_COMMITS[@]} 个"
+echo "Test failed: ${#FAILED_COMMITS[@]}"
 [ ${#FAILED_COMMITS[@]} -gt 0 ] && echo "   ${FAILED_COMMITS[*]}"
 
-echo "⚠️ 冲突: ${#CONFLICT_COMMITS[@]} 个"
+echo "Conflict: ${#CONFLICT_COMMITS[@]}"
 [ ${#CONFLICT_COMMITS[@]} -gt 0 ] && echo "   ${CONFLICT_COMMITS[*]}"
 
-# 最终状态：工作区已清理
-cleanup
+echo "Push failed: ${#PUSH_FAILED_COMMITS[@]}"
+[ ${#PUSH_FAILED_COMMITS[@]} -gt 0 ] && echo "   ${PUSH_FAILED_COMMITS[*]}"
 
-# 如果全部成功，提交推送
 TOTAL_PASSED=${#PASSED_COMMITS[@]}
 TOTAL_COMMITS=${#COMMITS[@]}
 
+if [ $TOTAL_PASSED -gt 0 ]; then
+    print_git_log "$TARGET_BRANCH"
+fi
+
 if [ $TOTAL_PASSED -eq $TOTAL_COMMITS ]; then
-    echo ""
-    echo "🎉 全部成功! 提交并推送..."
-    
-    # 重新 cherry-pick 全部
-    for COMMIT in "${PASSED_COMMITS[@]}"; do
-        git cherry-pick "$COMMIT" --no-commit 2>/dev/null || true
-    done
-    
-    git add -A
-    git commit -m "Step cherry-pick: ${PASSED_COMMITS[*]} → $TARGET_BRANCH" 2>/dev/null || true
-    
-    if git push origin "$TARGET_BRANCH" 2>/dev/null; then
-        echo "✅ 推送成功"
-    else
-        echo "⚠️ 推送失败 (本地OK)"
-    fi
-    
     echo "STEP_SUCCESS"
-    echo "PASSED:${PASSED_COMMITS[*]}"
-    echo "FAILED:${FAILED_COMMITS[*]}"
-    echo "CONFLICT:${CONFLICT_COMMITS[*]}"
-    exit 0
-else
-    echo ""
-    echo "📝 部分通过，提交已通过的 commits..."
-    
-    # 只提交通过的
-    if [ $TOTAL_PASSED -gt 0 ]; then
-        cleanup
-        for COMMIT in "${PASSED_COMMITS[@]}"; do
-            git cherry-pick "$COMMIT" --no-commit 2>/dev/null || true
-        done
-        
-        git add -A
-        git commit -m "Step cherry-pick (partial): ${PASSED_COMMITS[*]} → $TARGET_BRANCH" 2>/dev/null || true
-        
-        if git push origin "$TARGET_BRANCH" 2>/dev/null; then
-            echo "✅ 推送成功"
-        else
-            echo "⚠️ 推送失败 (本地OK)"
-        fi
-    fi
-    
-    cleanup
-    
+elif [ $TOTAL_PASSED -gt 0 ]; then
     echo "STEP_PARTIAL"
-    echo "PASSED:${PASSED_COMMITS[*]}"
-    echo "FAILED:${FAILED_COMMITS[*]}"
-    echo "CONFLICT:${CONFLICT_COMMITS[*]}"
-    exit 1
+else
+    echo "STEP_ALL_FAILED"
+fi
+
+echo "PASSED:$(IFS=,; echo "${PASSED_COMMITS[*]}")"
+echo "FAILED:$(IFS=,; echo "${FAILED_COMMITS[*]}")"
+echo "CONFLICT:$(IFS=,; echo "${CONFLICT_COMMITS[*]}")"
+echo "PUSH_FAILED:$(IFS=,; echo "${PUSH_FAILED_COMMITS[*]}")"
+
+if [ $TOTAL_PASSED -eq $TOTAL_COMMITS ]; then
+    finish 0
+else
+    finish 1
 fi
