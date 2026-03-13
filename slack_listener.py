@@ -6,6 +6,7 @@ Slack Socket Mode Listener - Async queue + structured logging + AI analysis
 """
 
 import glob
+import json
 import logging
 import os
 import re
@@ -506,56 +507,98 @@ def resolve_change_id(change_id):
     return commit
 
 
+def _get_gerrit_ssh_info():
+    """Parse Gerrit SSH host/port/user from git push remote URL."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "--push", "origin"],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
+        )
+        url = result.stdout.strip()
+        m = re.match(r"ssh://([^@]+)@([^:]+):(\d+)/", url)
+        if m:
+            return m.group(1), m.group(2), int(m.group(3))
+    except Exception:
+        pass
+    return None, None, None
+
+
+def _resolve_change_via_gerrit_ssh(change_num):
+    """Resolve change number via Gerrit SSH query API (fast, ~2-3s)."""
+    user, host, port = _get_gerrit_ssh_info()
+    if not host:
+        return None, None
+    try:
+        result = subprocess.run(
+            ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=no",
+             "{}@{}".format(user, host),
+             "gerrit", "query", "--current-patch-set",
+             "change:{}".format(change_num), "--format=JSON"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None, None
+        first_line = result.stdout.strip().splitlines()[0]
+        data = json.loads(first_line)
+        ps = data.get("currentPatchSet", {})
+        return ps.get("revision"), ps.get("ref")
+    except Exception as e:
+        log.warning("[RESOLVE] Gerrit SSH query failed for %s: %s", change_num, e)
+    return None, None
+
+
+def _resolve_change_via_ls_remote(change_num):
+    """Resolve change number via git ls-remote (slow fallback)."""
+    suffix = change_num[-2:] if len(change_num) >= 2 else change_num
+    ref_pattern = "refs/changes/{}/{}/*".format(suffix, change_num)
+    result = subprocess.run(
+        ["git", "ls-remote", "origin", ref_pattern],
+        capture_output=True, text=True, cwd=REPO_PATH, timeout=120,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None, None
+
+    best_ps, best_commit, best_ref = 0, None, None
+    for line in result.stdout.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        commit_hash, ref_path = parts
+        ref_parts = ref_path.split("/")
+        if len(ref_parts) < 5 or not ref_parts[-1].isdigit():
+            continue
+        ps_num = int(ref_parts[-1])
+        if ps_num > best_ps:
+            best_ps, best_commit, best_ref = ps_num, commit_hash, ref_path
+    return best_commit, best_ref
+
+
 def resolve_change_number(change_num):
     """
     Resolve a Gerrit change number to the latest patchset commit hash.
-    Uses git ls-remote, then fetches the specific patchset ref.
+    Tries Gerrit SSH query API first (fast), falls back to git ls-remote.
     """
-    suffix = change_num[-2:] if len(change_num) >= 2 else change_num
-    ref_pattern = "refs/changes/{}/{}/*".format(suffix, change_num)
-    try:
-        result = subprocess.run(
-            ["git", "ls-remote", "origin", ref_pattern],
-            capture_output=True, text=True, cwd=REPO_PATH, timeout=60,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            log.warning("[RESOLVE] change# %s: no refs found", change_num)
+    best_commit, best_ref = _resolve_change_via_gerrit_ssh(change_num)
+
+    if not best_commit:
+        log.info("[RESOLVE] Gerrit SSH unavailable, falling back to ls-remote for %s", change_num)
+        try:
+            best_commit, best_ref = _resolve_change_via_ls_remote(change_num)
+        except Exception as e:
+            log.error("[RESOLVE] change# failed for %s: %s", change_num, e)
             return None
 
-        best_ps = 0
-        best_commit = None
-        best_ref = None
-        for line in result.stdout.strip().splitlines():
-            parts = line.split("\t")
-            if len(parts) != 2:
-                continue
-            commit_hash, ref_path = parts
-            ref_parts = ref_path.split("/")
-            if len(ref_parts) < 5:
-                continue
-            ps_str = ref_parts[-1]
-            if not ps_str.isdigit():
-                continue
-            ps_num = int(ps_str)
-            if ps_num > best_ps:
-                best_ps = ps_num
-                best_commit = commit_hash
-                best_ref = ref_path
+    if not best_commit:
+        log.warning("[RESOLVE] change# %s: not found", change_num)
+        return None
 
-        if not best_commit:
-            log.warning("[RESOLVE] change# %s: no patchset refs found", change_num)
-            return None
+    log.info("[RESOLVE] change# %s -> %s (ref=%s)", change_num, best_commit[:12], best_ref)
 
-        log.info("[RESOLVE] change# %s (PS %d) -> %s", change_num, best_ps, best_commit[:12])
+    if not _resolve_commit_locally(best_commit):
+        log.info("[RESOLVE] commit %s not local, fetching %s...", best_commit[:12], best_ref)
+        _git_fetch(best_ref)
 
-        if not _resolve_commit_locally(best_commit):
-            log.info("[RESOLVE] commit %s not local, fetching %s...", best_commit[:12], best_ref)
-            _git_fetch(best_ref)
-
-        return best_commit
-    except Exception as e:
-        log.error("[RESOLVE] change# failed for %s: %s", change_num, e)
-    return None
+    return best_commit
 
 
 def resolve_refs(refs, say, ts):
@@ -1033,6 +1076,20 @@ def process_task(task):
 
     commits = task.get("commits", [])
 
+    try:
+        save_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
+        ).stdout.strip()
+        save_branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
+        ).stdout.strip()
+    except Exception:
+        save_head, save_branch = "", ""
+    task["save_head"] = save_head
+    task["save_branch"] = save_branch
+
     log.info("[TASK] START type=%s commits=%s branch=%s user=%s(%s) log=%s",
              task_type, commits, target_branch,
              task.get("user_name", "?"), task.get("user", "?"), task_log_path)
@@ -1404,20 +1461,40 @@ def handle_mention(event, say, logger):
                     except Exception as e:
                         log.warning("[CANCEL] failed to kill pid %d: %s", pid, e)
 
-                # Rollback repo: abort cherry-pick + reset
+                # Rollback repo: abort cherry-pick + reset to pre-task HEAD
                 try:
                     subprocess.run(
                         ["git", "cherry-pick", "--abort"],
                         capture_output=True, cwd=REPO_PATH, timeout=10,
                     )
                     subprocess.run(
-                        ["git", "reset", "--hard", "HEAD"],
+                        ["git", "revert", "--abort"],
                         capture_output=True, cwd=REPO_PATH, timeout=10,
                     )
+                    save_head = cancelled_task.get("save_head", "")
+                    save_branch = cancelled_task.get("save_branch", "")
+                    if save_head:
+                        subprocess.run(
+                            ["git", "reset", "--hard", save_head],
+                            capture_output=True, cwd=REPO_PATH, timeout=10,
+                        )
+                        log.info("[CANCEL] reset to save_head %s", save_head[:12])
+                    else:
+                        subprocess.run(
+                            ["git", "reset", "--hard", "HEAD"],
+                            capture_output=True, cwd=REPO_PATH, timeout=10,
+                        )
+                        log.warning("[CANCEL] no save_head, reset to HEAD (may not fully rollback)")
                     subprocess.run(
                         ["git", "clean", "-fd"],
                         capture_output=True, cwd=REPO_PATH, timeout=10,
                     )
+                    if save_branch:
+                        subprocess.run(
+                            ["git", "checkout", save_branch],
+                            capture_output=True, cwd=REPO_PATH, timeout=10,
+                        )
+                        log.info("[CANCEL] switched back to %s", save_branch)
                     log.info("[CANCEL] repo rolled back")
                 except Exception as e:
                     log.warning("[CANCEL] rollback error: %s", e)

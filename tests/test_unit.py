@@ -186,6 +186,19 @@ class TestParseRefsAndBranch:
         assert branch == ""
 
 
+class TestTaskElapsed:
+    def test_with_started_at(self):
+        task = {"started_at": time.time() - 65}
+        result = sl._task_elapsed(task)
+        assert "m" in result
+
+    def test_without_started_at(self):
+        assert sl._task_elapsed({}) == ""
+
+    def test_none_started_at(self):
+        assert sl._task_elapsed({"started_at": None}) == ""
+
+
 class TestIsProcessAlive:
     def test_own_pid(self):
         assert sl._is_process_alive(os.getpid()) is True

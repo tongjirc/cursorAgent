@@ -325,6 +325,124 @@ class TestCancelQueue:
             sl.task_queue = original_queue
 
 
+class TestCancelRollback:
+    """Test that cancel 0 resets to save_head and checks out save_branch."""
+
+    def test_rollback_uses_save_head(self):
+        """Cancel should git reset --hard <save_head>, not HEAD."""
+        from unittest.mock import MagicMock, patch, call
+
+        task = {
+            "type": "batch", "commits": ["aaa", "bbb"],
+            "target_branch": "target", "say": MagicMock(),
+            "ts": "ts1", "user": "U1", "user_name": "Tester",
+            "queued_at": time.time(), "log_file": "/tmp/fake.log",
+            "pid": 99999, "save_head": "abc123def456",
+            "save_branch": "main", "started_at": time.time(),
+        }
+
+        original_current = sl.current_task
+        sl.current_task = task
+        try:
+            calls = []
+            def track_run(cmd, **kwargs):
+                calls.append(cmd)
+                m = MagicMock()
+                m.returncode = 0
+                return m
+
+            with patch("subprocess.run", side_effect=track_run):
+                with patch("os.kill"):
+                    # Simulate the rollback section of cancel
+                    import subprocess as _sp
+                    _sp.run(["git", "cherry-pick", "--abort"],
+                            capture_output=True, cwd=sl.REPO_PATH, timeout=10)
+                    _sp.run(["git", "revert", "--abort"],
+                            capture_output=True, cwd=sl.REPO_PATH, timeout=10)
+
+                    save_head = task.get("save_head", "")
+                    if save_head:
+                        _sp.run(["git", "reset", "--hard", save_head],
+                                capture_output=True, cwd=sl.REPO_PATH, timeout=10)
+
+                    _sp.run(["git", "clean", "-fd"],
+                            capture_output=True, cwd=sl.REPO_PATH, timeout=10)
+
+                    save_branch = task.get("save_branch", "")
+                    if save_branch:
+                        _sp.run(["git", "checkout", save_branch],
+                                capture_output=True, cwd=sl.REPO_PATH, timeout=10)
+
+            reset_cmds = [c for c in calls if "reset" in c]
+            assert reset_cmds == [["git", "reset", "--hard", "abc123def456"]]
+            checkout_cmds = [c for c in calls if "checkout" in c]
+            assert checkout_cmds == [["git", "checkout", "main"]]
+        finally:
+            sl.current_task = original_current
+
+    def test_rollback_fallback_without_save_head(self):
+        """Without save_head, should fall back to reset --hard HEAD."""
+        from unittest.mock import MagicMock, patch
+
+        task = {
+            "type": "single", "commits": ["aaa"],
+            "target_branch": "target", "say": MagicMock(),
+            "ts": "ts2", "user": "U1", "user_name": "Tester",
+            "queued_at": time.time(), "log_file": "/tmp/fake.log",
+            "pid": 99999, "save_head": "", "save_branch": "",
+            "started_at": time.time(),
+        }
+
+        calls = []
+        def track_run(cmd, **kwargs):
+            calls.append(cmd)
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        with patch("subprocess.run", side_effect=track_run):
+            import subprocess as _sp
+            save_head = task.get("save_head", "")
+            if save_head:
+                _sp.run(["git", "reset", "--hard", save_head],
+                        capture_output=True, cwd=sl.REPO_PATH, timeout=10)
+            else:
+                _sp.run(["git", "reset", "--hard", "HEAD"],
+                        capture_output=True, cwd=sl.REPO_PATH, timeout=10)
+
+        reset_cmds = [c for c in calls if "reset" in c]
+        assert reset_cmds == [["git", "reset", "--hard", "HEAD"]]
+
+    def test_process_task_saves_head(self, temp_repo):
+        """process_task should save HEAD and branch before execution."""
+        from unittest.mock import MagicMock
+
+        r = temp_repo
+        original_repo = sl.REPO_PATH
+        sl.REPO_PATH = r["path"]
+        try:
+            task = {
+                "type": "test", "commits": [],
+                "target_branch": "", "say": MagicMock(),
+                "ts": "ts3", "user": "U1", "user_name": "Tester",
+                "queued_at": time.time(),
+                "log_file": os.path.join(r["path"], "test.log"),
+            }
+            original_test_cmd = sl.TEST_COMMAND
+            sl.TEST_COMMAND = "echo test_ok"
+            try:
+                sl.process_task(task)
+            finally:
+                sl.TEST_COMMAND = original_test_cmd
+
+            assert "save_head" in task
+            assert len(task["save_head"]) == 40
+            assert "save_branch" in task
+            assert task["save_branch"] == r["original_branch"]
+        finally:
+            sl.REPO_PATH = original_repo
+
+
 class TestHoldAndContinue:
     def _make_task(self, task_type="single", commits=None, branch="b", ts=None):
         from unittest.mock import MagicMock

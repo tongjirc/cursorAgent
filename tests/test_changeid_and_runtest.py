@@ -99,6 +99,106 @@ class TestResolveChangeId:
             sl.REPO_PATH = original_repo
 
 
+# ======================== Gerrit SSH helpers ========================
+
+class TestGetGerritSshInfo:
+    def test_parses_ssh_url(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ssh://alvichen@git-av.nvidia.com:12013/ndas\n"
+        with patch("subprocess.run", return_value=mock_result):
+            user, host, port = sl._get_gerrit_ssh_info()
+        assert user == "alvichen"
+        assert host == "git-av.nvidia.com"
+        assert port == 12013
+
+    def test_returns_none_for_https_url(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "https://github.com/org/repo.git\n"
+        with patch("subprocess.run", return_value=mock_result):
+            user, host, port = sl._get_gerrit_ssh_info()
+        assert user is None
+        assert host is None
+
+    def test_returns_none_on_error(self):
+        with patch("subprocess.run", side_effect=Exception("fail")):
+            user, host, port = sl._get_gerrit_ssh_info()
+        assert user is None
+
+
+class TestResolveChangeViaGerritSsh:
+    def test_parses_json_response(self):
+        json_line = (
+            '{"project":"ndas","number":763116,'
+            '"currentPatchSet":{"number":20,'
+            '"revision":"7852d18868e5a2697b5f33d1d4828ffd77319100",'
+            '"ref":"refs/changes/16/763116/20"}}\n'
+            '{"type":"stats","rowCount":1}\n'
+        )
+        mock_url = MagicMock()
+        mock_url.returncode = 0
+        mock_url.stdout = "ssh://user@host.com:12013/ndas\n"
+
+        mock_ssh = MagicMock()
+        mock_ssh.returncode = 0
+        mock_ssh.stdout = json_line
+
+        with patch("subprocess.run", side_effect=[mock_url, mock_ssh]):
+            commit, ref = sl._resolve_change_via_gerrit_ssh("763116")
+        assert commit == "7852d18868e5a2697b5f33d1d4828ffd77319100"
+        assert ref == "refs/changes/16/763116/20"
+
+    def test_returns_none_when_no_ssh_info(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "https://github.com/org/repo.git\n"
+        with patch("subprocess.run", return_value=mock_result):
+            commit, ref = sl._resolve_change_via_gerrit_ssh("763116")
+        assert commit is None
+        assert ref is None
+
+    def test_returns_none_on_empty_response(self):
+        mock_url = MagicMock()
+        mock_url.returncode = 0
+        mock_url.stdout = "ssh://user@host.com:12013/ndas\n"
+
+        mock_ssh = MagicMock()
+        mock_ssh.returncode = 0
+        mock_ssh.stdout = ""
+
+        with patch("subprocess.run", side_effect=[mock_url, mock_ssh]):
+            commit, ref = sl._resolve_change_via_gerrit_ssh("999999")
+        assert commit is None
+
+
+class TestResolveChangeViaLsRemote:
+    def test_parses_ls_remote_output(self):
+        ls_output = (
+            "aaa111\trefs/changes/10/766210/1\n"
+            "bbb222\trefs/changes/10/766210/2\n"
+            "ccc333\trefs/changes/10/766210/3\n"
+        )
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ls_output
+
+        with patch("subprocess.run", return_value=mock_result):
+            commit, ref = sl._resolve_change_via_ls_remote("766210")
+        assert commit == "ccc333"
+        assert ref == "refs/changes/10/766210/3"
+
+    def test_returns_none_for_empty(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+
+        with patch("subprocess.run", return_value=mock_result):
+            commit, ref = sl._resolve_change_via_ls_remote("999999")
+        assert commit is None
+        assert ref is None
+
+
 # ======================== resolve_change_number ========================
 
 class TestResolveChangeNumber:

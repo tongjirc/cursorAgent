@@ -35,18 +35,19 @@ cp .env.example .env
 
 **Foreground (for debugging):**
 ```bash
+cd /path/to/cursorAgent
 source venv/bin/activate
 sg docker -c "python3 slack_listener.py"
 ```
 
 **Background (survives SSH disconnect):**
 ```bash
-cd /home/testlocal/cursorAgent
-nohup sg docker -c "venv/bin/python3 slack_listener.py" > logs/bot_stdout.log 2>&1 &
+cd /path/to/cursorAgent
+nohup sg docker -c "cd $(pwd) && venv/bin/python3 slack_listener.py" > logs/bot_stdout.log 2>&1 &
 echo $!  # print PID
 ```
 
-Stop: `kill $(cat logs/bot.pid 2>/dev/null || pgrep -f slack_listener.py)`
+Stop: `kill $(pgrep -f slack_listener.py)`
 
 ## Slack Commands
 
