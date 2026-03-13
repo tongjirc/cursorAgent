@@ -209,7 +209,7 @@ def run_command(cmd_str, timeout, task_log_path, label=""):
     """
     assert_cwd_is_repo()
 
-    full_cmd = "cd {repo} && {init} && {cmd}".format(
+    full_cmd = "cd {repo} && {{ {init} || true; }} && {cmd}".format(
         repo=_quote(REPO_PATH), init=SHELL_INIT, cmd=cmd_str,
     )
 
@@ -281,7 +281,7 @@ def read_task_log_tail(task_log_path, lines=15):
 
 # ======================== AI analysis (Cursor Agent CLI) ========================
 
-AGENT_BIN = os.environ.get("AGENT_BIN", "/home/alvichen/.local/bin/agent")
+AGENT_BIN = os.environ.get("AGENT_BIN", os.path.expanduser("~/.local/bin/agent"))
 AGENT_TIMEOUT = int(os.environ.get("AGENT_TIMEOUT", "300"))
 AGENT_MODEL = os.environ.get("AGENT_MODEL", "")  # e.g. gpt-5.3-codex-fast
 
@@ -843,10 +843,18 @@ def _handle_test_or_infra_fail(say, ts, output):
             say("🤖 *AI suggestion:*\n\n{}".format(ai), thread_ts=ts)
 
 
+def _task_elapsed(task):
+    started = task.get("started_at")
+    if not started:
+        return ""
+    return _fmt_elapsed(time.time() - started)
+
+
 def handle_single_result(result, task):
     say, ts = task["say"], task["ts"]
     commit_id, target_branch = task["commits"][0], task["target_branch"]
     m = _mention(task)
+    elapsed = _task_elapsed(task)
 
     if result.get("is_no_change"):
         say("{} ℹ️ *Cherry-Pick produced no changes*\n\n"
@@ -854,7 +862,7 @@ def handle_single_result(result, task):
         return
     if result.get("success"):
         git_log = _extract_git_log(result["output"])
-        msg = "{} ✅ *Cherry-Pick succeeded!* Please trigger alfred build manually.\n`{}` → `{}`".format(m, commit_id, target_branch)
+        msg = "{} ✅ *Cherry-Pick succeeded!* ({}) Please trigger alfred build manually.\n`{}` → `{}`".format(m, elapsed, commit_id, target_branch)
         if git_log:
             msg += "\n\n```{}```".format(git_log)
         say(msg, thread_ts=ts)
@@ -882,12 +890,13 @@ def handle_single_result(result, task):
 def handle_batch_result(result, task):
     say, ts, commits = task["say"], task["ts"], task["commits"]
     m = _mention(task)
+    elapsed = _task_elapsed(task)
 
     if result.get("success"):
         passed = result.get("passed_commits", [])
         git_log = _extract_git_log(result["output"])
-        msg = "{} ✅ *Batch Cherry-Pick succeeded!* Please trigger alfred build manually.\n\nPassed: `{}`".format(
-            m, ", ".join(passed) if passed else ", ".join(commits))
+        msg = "{} ✅ *Batch Cherry-Pick succeeded!* ({}) Please trigger alfred build manually.\n\nPassed: `{}`".format(
+            m, elapsed, ", ".join(passed) if passed else ", ".join(commits))
         if git_log:
             msg += "\n\n```{}```".format(git_log)
         say(msg, thread_ts=ts)
@@ -923,8 +932,10 @@ def handle_step_result(result, task):
     push_failed = result.get("push_failed_commits", [])
     git_log = _extract_git_log(result["output"])
 
+    elapsed = _task_elapsed(task)
+
     if result.get("success"):
-        msg = "{} ✅ *All succeeded + pushed!* Please trigger alfred build manually.\n\nPassed: `{}`".format(m, ", ".join(passed))
+        msg = "{} ✅ *All succeeded + pushed!* ({}) Please trigger alfred build manually.\n\nPassed: `{}`".format(m, elapsed, ", ".join(passed))
         if git_log:
             msg += "\n\n```{}```".format(git_log)
         say(msg, thread_ts=ts)
@@ -958,12 +969,13 @@ def handle_step_result(result, task):
 def handle_revert_result(result, task):
     say, ts, commits = task["say"], task["ts"], task["commits"]
     m = _mention(task)
+    elapsed = _task_elapsed(task)
 
     if result.get("success"):
         passed = result.get("passed_commits", [])
         git_log = _extract_git_log(result["output"])
-        msg = "{} ✅ *Revert succeeded!* Please trigger alfred build manually.\n\nReverted: `{}`".format(
-            m, ", ".join(passed) if passed else ", ".join(commits))
+        msg = "{} ✅ *Revert succeeded!* ({}) Please trigger alfred build manually.\n\nReverted: `{}`".format(
+            m, elapsed, ", ".join(passed) if passed else ", ".join(commits))
         if git_log:
             msg += "\n\n```{}```".format(git_log)
         say(msg, thread_ts=ts)
@@ -993,13 +1005,14 @@ def handle_revert_result(result, task):
 def handle_test_result(result, task):
     say, ts = task["say"], task["ts"]
     m = _mention(task)
+    elapsed = _task_elapsed(task)
     branch = result.get("branch", "unknown")
     if result.get("success"):
-        say("{} ✅ *Test passed!*\n\nBranch: `{}`\n\n```{}```".format(
-            m, branch, get_output_tail(result["output"], 15)), thread_ts=ts)
+        say("{} ✅ *Test passed!* ({})\n\nBranch: `{}`\n\n```{}```".format(
+            m, elapsed, branch, get_output_tail(result["output"], 15)), thread_ts=ts)
     else:
-        say("{} ❌ *Test failed*\n\nBranch: `{}`\n\n```{}```".format(
-            m, branch, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ❌ *Test failed* ({})\n\nBranch: `{}`\n\n```{}```".format(
+            m, elapsed, branch, get_output_tail(result["output"])), thread_ts=ts)
         _handle_test_or_infra_fail(say, ts, result["output"])
 
 

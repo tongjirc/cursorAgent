@@ -32,10 +32,21 @@ cp .env.example .env
 ```
 
 ### 3. Start Bot
+
+**Foreground (for debugging):**
 ```bash
 source venv/bin/activate
-python3 slack_listener.py
+sg docker -c "python3 slack_listener.py"
 ```
+
+**Background (survives SSH disconnect):**
+```bash
+cd /home/testlocal/cursorAgent
+nohup sg docker -c "venv/bin/python3 slack_listener.py" > logs/bot_stdout.log 2>&1 &
+echo $!  # print PID
+```
+
+Stop: `kill $(cat logs/bot.pid 2>/dev/null || pgrep -f slack_listener.py)`
 
 ## Slack Commands
 
