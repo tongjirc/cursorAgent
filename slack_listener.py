@@ -16,8 +16,6 @@ import threading
 import time
 from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
-from queue import Queue
-
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
@@ -45,6 +43,9 @@ TEST_TIMEOUT = int(os.environ.get("TEST_TIMEOUT", "3600"))
 SHELL_INIT = os.environ.get("SHELL_INIT", "source ~/.bashrc")
 LOG_RETAIN_HOURS = int(os.environ.get("LOG_RETAIN_HOURS", "36"))
 ADMIN_USER_IDS = [x.strip() for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip()]
+MANUAL_TIMEOUT = int(os.environ.get("MANUAL_TIMEOUT", "1800"))
+FAILURE_WAIT_TIMEOUT = int(os.environ.get("FAILURE_WAIT_TIMEOUT", "300"))
+MAX_INFRA_RETRIES = int(os.environ.get("MAX_INFRA_RETRIES", "2"))
 # =====================================================================
 
 if not REPO_PATH:
@@ -87,18 +88,38 @@ log.addHandler(_ch)
 
 # ======================== Global state ========================
 
-task_queue = Queue()
+task_list = []
+task_condition = threading.Condition()
 pending_tasks = []
 state_lock = threading.Lock()
 current_task = None
 task_history = OrderedDict()
 MAX_HISTORY = 20
 hold_event = threading.Event()
-hold_event.set()  # open by default (not paused)
-hold_before_ts = None  # ts of the task to pause before
-hold_requested_by = None  # user_id who requested the hold
+hold_event.set()
+hold_before_ts = None
+hold_requested_by = None
+session_default_branch = ""
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 BOT_ID = None
+
+
+def _put_task(task, urgent=False):
+    """Add task to the internal queue. urgent=True inserts at front."""
+    with task_condition:
+        if urgent:
+            task_list.insert(0, task)
+        else:
+            task_list.append(task)
+        task_condition.notify()
+
+
+def _get_task():
+    """Block until a task is available, then return it."""
+    with task_condition:
+        while not task_list:
+            task_condition.wait()
+        return task_list.pop(0)
 
 # ======================== User name cache ========================
 
@@ -154,6 +175,96 @@ def validate_repo_path():
 def assert_cwd_is_repo():
     if not os.path.isdir(REPO_PATH):
         raise RuntimeError("REPO_PATH disappeared: {}".format(REPO_PATH))
+
+
+def _get_current_head():
+    """Return current HEAD commit hash, or empty string on error."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _get_current_branch():
+    """Return current branch name, or empty string on error."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _get_recent_commits(n=10):
+    """Return recent git log lines for reporting."""
+    try:
+        result = subprocess.run(
+            ["git", "--no-pager", "log",
+             "--pretty=format:%h %s <%an>", "--abbrev-commit", "-{}".format(n)],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _get_remote_head(branch):
+    """Get remote HEAD hash via ls-remote (lightweight, no full fetch)."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "origin", "refs/heads/{}".format(branch)],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().split()[0]
+    except Exception:
+        pass
+    return ""
+
+
+def check_branch_health(target_branch):
+    """
+    Lightweight branch health check (no UT).
+    Returns (ok: bool, message: str).
+    """
+    if not target_branch:
+        return True, ""
+
+    try:
+        result = subprocess.run(
+            ["git", "fetch", "origin", target_branch],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=60,
+        )
+        if result.returncode != 0:
+            return False, "Cannot fetch branch `{}`: {}".format(
+                target_branch, result.stderr.strip()[:200])
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
+        )
+        if status.stdout.strip():
+            log.warning("[HEALTH] dirty working tree: %s", status.stdout.strip()[:200])
+            subprocess.run(
+                ["git", "reset", "--hard", "HEAD"],
+                capture_output=True, cwd=REPO_PATH, timeout=10,
+            )
+            subprocess.run(
+                ["git", "clean", "-fd"],
+                capture_output=True, cwd=REPO_PATH, timeout=10,
+            )
+
+        return True, ""
+    except subprocess.TimeoutExpired:
+        return False, "Branch health check timed out"
+    except Exception as e:
+        return False, "Branch health check error: {}".format(e)
 
 
 # ======================== Task log files ========================
@@ -860,6 +971,77 @@ def extract_single_value(output, prefix):
     return None
 
 
+# ======================== Reporting helpers ========================
+
+def _next_in_queue_msg():
+    """Return a message about who/what is next in queue."""
+    with state_lock:
+        if not pending_tasks:
+            return "Queue is empty"
+        nxt = pending_tasks[0]
+        return "Next: {}".format(_task_summary(nxt))
+
+
+def _post_success_report(task, result):
+    """Post a comprehensive success report after CP/revert, matching team format."""
+    say, ts = task["say"], task["ts"]
+    m = _mention(task)
+    elapsed = _task_elapsed(task)
+    target_branch = task.get("target_branch", "")
+    task_type = task.get("type", "")
+
+    git_log = _extract_git_log(result.get("output", ""))
+    if not git_log:
+        git_log = _get_recent_commits(10)
+
+    lines = []
+    if task_type == "revert":
+        lines.append("{} :white_check_mark: *Revert succeeded!* ({})".format(m, elapsed))
+    else:
+        lines.append("{} :white_check_mark: *Cherry-Pick succeeded!* ({})".format(m, elapsed))
+    lines.append("Branch: `{}`".format(target_branch))
+    if git_log:
+        lines.append("\n```{}```".format(git_log))
+    lines.append("\n:hammer: *Please trigger Alfred build manually.*")
+    lines.append(_next_in_queue_msg())
+    say("\n".join(lines), thread_ts=ts)
+
+
+def _post_manual_done_report(task):
+    """Post report when manual mode finishes. Detects HEAD changes."""
+    say, ts = task["say"], task["ts"]
+    m = _mention(task)
+    target_branch = task.get("target_branch", "")
+    head_before = task.get("head_before_manual", "")
+    head_after = _get_current_head()
+
+    lines = ["{} :white_check_mark: *Manual operation complete!*".format(m)]
+    lines.append("Branch: `{}`".format(target_branch))
+
+    if head_before and head_after and head_before != head_after:
+        try:
+            result = subprocess.run(
+                ["git", "--no-pager", "log", "--oneline",
+                 "{}..{}".format(head_before, head_after)],
+                capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
+            )
+            new_commits = result.stdout.strip() if result.returncode == 0 else ""
+            commit_count = len(new_commits.splitlines()) if new_commits else 0
+            lines.append("HEAD changed: `{}` → `{}` (+{} commits)".format(
+                head_before[:12], head_after[:12], commit_count))
+            if new_commits:
+                lines.append("\n```{}```".format(new_commits))
+        except Exception:
+            lines.append("HEAD changed: `{}` → `{}`".format(
+                head_before[:12], head_after[:12]))
+    elif head_before == head_after:
+        lines.append("HEAD unchanged: `{}`".format(head_after[:12] if head_after else "?"))
+
+    lines.append("\n:hammer: *Please trigger Alfred build manually.*")
+    lines.append(_next_in_queue_msg())
+    say("\n".join(lines), thread_ts=ts)
+
+
 # ======================== Task result handlers ========================
 
 def _mention(task):
@@ -883,7 +1065,7 @@ def _handle_test_or_infra_fail(say, ts, output):
     else:
         ai = analyze_test_failure(output)
         if ai:
-            say("🤖 *AI suggestion:*\n\n{}".format(ai), thread_ts=ts)
+            say("🤖 *AI analysis:*\n\n{}".format(ai), thread_ts=ts)
 
 
 def _task_elapsed(task):
@@ -891,6 +1073,32 @@ def _task_elapsed(task):
     if not started:
         return ""
     return _fmt_elapsed(time.time() - started)
+
+
+def _tips_conflict(m):
+    return (
+        "\n\n💡 *What you can do:*\n"
+        "• Reply `manual` — resolve conflicts manually (branch locked for you)\n"
+        "• Reply `cancel 0` — cancel and let the next person go\n"
+        "• Fix locally, then re-submit with new patchset: `cherry-pick <new_ref> <branch>`"
+    )
+
+
+def _tips_test_fail(m):
+    return (
+        "\n\n💡 *What you can do:*\n"
+        "• Reply `manual` — cherry-pick manually and debug locally\n"
+        "• Reply `cancel 0` — cancel and let the next person go\n"
+        "• Check if it's a flaky test or infra issue, fix and re-submit"
+    )
+
+
+def _tips_push_fail():
+    return (
+        "\n\n💡 *What you can do:*\n"
+        "• Someone may have pushed before you. Reply `manual` to handle it\n"
+        "• Or re-send the same command to retry"
+    )
 
 
 def handle_single_result(result, task):
@@ -901,33 +1109,37 @@ def handle_single_result(result, task):
 
     if result.get("is_no_change"):
         say("{} ℹ️ *Cherry-Pick produced no changes*\n\n"
-            "Commit `{}` may already exist on `{}`.".format(m, commit_id, target_branch), thread_ts=ts)
+            "Commit `{}` may already exist on `{}`.\n\n"
+            "💡 Please verify if the CL already exists on this branch. Use `status` to check.".format(
+                m, commit_id, target_branch), thread_ts=ts)
         return
     if result.get("success"):
         git_log = _extract_git_log(result["output"])
-        msg = "{} ✅ *Cherry-Pick succeeded!* ({}) Please trigger alfred build manually.\n`{}` → `{}`".format(m, elapsed, commit_id, target_branch)
+        msg = "{} ✅ *Cherry-Pick succeeded!* ({})\n`{}` → `{}`".format(m, elapsed, commit_id, target_branch)
         if git_log:
             msg += "\n\n```{}```".format(git_log)
         say(msg, thread_ts=ts)
         return
     if result.get("is_conflict"):
         conflict_files = extract_single_value(result["output"], "FILES:") or "unknown"
-        say("{} ⚠️ *Cherry-Pick conflict*\nConflict files: `{}`\n\n```{}```".format(
-            m, conflict_files, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ⚠️ *Cherry-Pick conflict* (rolled back)\nConflict files: `{}`\n\n```{}```{}".format(
+            m, conflict_files, get_output_tail(result["output"]), _tips_conflict(m)), thread_ts=ts)
         ai = analyze_conflict(conflict_files, result["output"])
         if ai:
-            say("🤖 *AI suggestion:*\n\n{}".format(ai), thread_ts=ts)
+            say("🤖 *AI analysis:*\n\n{}".format(ai), thread_ts=ts)
         return
     if result.get("is_test_fail"):
-        say("{} ⚠️ *Cherry-Pick test failed* (rolled back)\n\n```{}```".format(
-            m, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ⚠️ *Cherry-Pick test failed* (rolled back)\n\n```{}```{}".format(
+            m, get_output_tail(result["output"]), _tips_test_fail(m)), thread_ts=ts)
         _handle_test_or_infra_fail(say, ts, result["output"])
         return
     if result.get("is_push_fail"):
-        say("{} ❌ *Push failed* (local commit reverted)\n\n```{}```".format(
-            m, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ❌ *Push failed* (local commit reverted)\n\n```{}```{}".format(
+            m, get_output_tail(result["output"]), _tips_push_fail()), thread_ts=ts)
         return
-    say("{} ❌ *Failed:*\n\n```{}```".format(m, get_output_tail(result["output"])), thread_ts=ts)
+    say("{} ❌ *Failed:*\n\n```{}```\n\n"
+        "💡 Reply `manual` to handle manually, or `cancel 0` to cancel.".format(
+            m, get_output_tail(result["output"])), thread_ts=ts)
 
 
 def handle_batch_result(result, task):
@@ -938,7 +1150,7 @@ def handle_batch_result(result, task):
     if result.get("success"):
         passed = result.get("passed_commits", [])
         git_log = _extract_git_log(result["output"])
-        msg = "{} ✅ *Batch Cherry-Pick succeeded!* ({}) Please trigger alfred build manually.\n\nPassed: `{}`".format(
+        msg = "{} ✅ *Batch Cherry-Pick succeeded!* ({})\n\nPassed: `{}`".format(
             m, elapsed, ", ".join(passed) if passed else ", ".join(commits))
         if git_log:
             msg += "\n\n```{}```".format(git_log)
@@ -947,23 +1159,29 @@ def handle_batch_result(result, task):
     if result.get("is_conflict"):
         fc = result.get("failed_commit") or "unknown"
         conflict_files = extract_single_value(result["output"], "FILES:") or "unknown"
-        say("{} ⚠️ *Batch Cherry-Pick conflict!*\nConflict commit: `{}`\n"
-            "Conflict files: `{}`\n\n```{}```\n\nAll rolled back".format(
+        say("{} ⚠️ *Batch Cherry-Pick conflict!* (all rolled back)\n"
+            "Conflict commit: `{}`\nConflict files: `{}`\n\n```{}```\n\n"
+            "💡 *Suggestion:* The conflicting CL needs manual resolution:\n"
+            "• Reply `manual` — resolve conflicts manually\n"
+            "• Use `step-cp` instead of `batch-cp` so non-conflicting CLs can land first\n"
+            "• Fix locally, then re-submit with new patchset".format(
                 m, fc, conflict_files, get_output_tail(result["output"])), thread_ts=ts)
         ai = analyze_conflict(conflict_files, result["output"])
         if ai:
-            say("🤖 *AI suggestion:*\n\n{}".format(ai), thread_ts=ts)
+            say("🤖 *AI analysis:*\n\n{}".format(ai), thread_ts=ts)
         return
     if result.get("is_test_fail"):
-        say("{} ❌ *Batch test failed!* All rolled back\n\n```{}```".format(
-            m, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ❌ *Batch test failed!* (all rolled back)\n\n```{}```{}".format(
+            m, get_output_tail(result["output"]), _tips_test_fail(m)), thread_ts=ts)
         _handle_test_or_infra_fail(say, ts, result["output"])
         return
     if result.get("is_push_fail"):
-        say("{} ❌ *Batch push failed!* All local commits reverted\n\n```{}```".format(
-            m, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ❌ *Batch push failed!* All local commits reverted\n\n```{}```{}".format(
+            m, get_output_tail(result["output"]), _tips_push_fail()), thread_ts=ts)
         return
-    say("{} ❌ *Batch failed:*\n\n```{}```".format(m, get_output_tail(result["output"])), thread_ts=ts)
+    say("{} ❌ *Batch failed:*\n\n```{}```\n\n"
+        "💡 Reply `manual` to handle manually, or `cancel 0` to cancel.".format(
+            m, get_output_tail(result["output"])), thread_ts=ts)
 
 
 def handle_step_result(result, task):
@@ -978,7 +1196,7 @@ def handle_step_result(result, task):
     elapsed = _task_elapsed(task)
 
     if result.get("success"):
-        msg = "{} ✅ *All succeeded + pushed!* ({}) Please trigger alfred build manually.\n\nPassed: `{}`".format(m, elapsed, ", ".join(passed))
+        msg = "{} ✅ *All succeeded + pushed!* ({})\n\nPassed: `{}`".format(m, elapsed, ", ".join(passed))
         if git_log:
             msg += "\n\n```{}```".format(git_log)
         say(msg, thread_ts=ts)
@@ -986,25 +1204,35 @@ def handle_step_result(result, task):
 
     lines = []
     if result.get("is_partial"):
-        lines.append("{} ⚠️ *Partial success*\n".format(m))
+        lines.append("{} ⚠️ *Partial success* ({})\n".format(m, elapsed))
     else:
-        lines.append("{} ❌ *Step failed*\n".format(m))
+        lines.append("{} ❌ *Step failed* ({})\n".format(m, elapsed))
     if passed:
         lines.append("✅ Passed + pushed: `{}`".format(", ".join(passed)))
     if failed:
-        lines.append("❌ Test failed: `{}`".format(", ".join(failed)))
+        lines.append("❌ Test failed (skipped): `{}`".format(", ".join(failed)))
     if conflict:
-        lines.append("⚠️ Conflict: `{}`".format(", ".join(conflict)))
+        lines.append("⚠️ Conflict (skipped): `{}`".format(", ".join(conflict)))
     if push_failed:
         lines.append("❌ Push failed (reverted): `{}`".format(", ".join(push_failed)))
     if git_log and passed:
         lines.append("\n```{}```".format(git_log))
+
+    tips = []
+    if conflict:
+        tips.append("• Conflicting CLs need local conflict resolution, then re-submit")
+    if failed:
+        tips.append("• Failed CLs need code fixes, then re-submit")
+    if conflict or failed:
+        tips.append("• Reply `manual` to handle remaining CLs manually")
+        lines.append("\n💡 *Suggestion:*\n{}".format("\n".join(tips)))
+
     say("\n".join(lines), thread_ts=ts)
 
     if conflict:
         ai = analyze_conflict(", ".join(conflict), result["output"])
         if ai:
-            say("🤖 *AI conflict suggestion:*\n\n{}".format(ai), thread_ts=ts)
+            say("🤖 *AI analysis:*\n\n{}".format(ai), thread_ts=ts)
     if failed:
         _handle_test_or_infra_fail(say, ts, result["output"])
 
@@ -1017,7 +1245,7 @@ def handle_revert_result(result, task):
     if result.get("success"):
         passed = result.get("passed_commits", [])
         git_log = _extract_git_log(result["output"])
-        msg = "{} ✅ *Revert succeeded!* ({}) Please trigger alfred build manually.\n\nReverted: `{}`".format(
+        msg = "{} ✅ *Revert succeeded!* ({})\n\nReverted: `{}`".format(
             m, elapsed, ", ".join(passed) if passed else ", ".join(commits))
         if git_log:
             msg += "\n\n```{}```".format(git_log)
@@ -1026,23 +1254,28 @@ def handle_revert_result(result, task):
     if result.get("is_conflict"):
         fc = result.get("failed_commit") or "unknown"
         conflict_files = extract_single_value(result["output"], "FILES:") or "unknown"
-        say("{} ⚠️ *Revert conflict!*\nConflict commit: `{}`\n"
-            "Conflict files: `{}`\n\n```{}```\n\nAll rolled back".format(
+        say("{} ⚠️ *Revert conflict!* (rolled back)\n"
+            "Conflict commit: `{}`\nConflict files: `{}`\n\n```{}```\n\n"
+            "💡 *Suggestion:* Revert conflict usually means later commits depend on the reverted code.\n"
+            "• Reply `manual` — handle revert manually\n"
+            "• Consider reverting dependent commits as well".format(
                 m, fc, conflict_files, get_output_tail(result["output"])), thread_ts=ts)
         ai = analyze_conflict(conflict_files, result["output"])
         if ai:
-            say("🤖 *AI suggestion:*\n\n{}".format(ai), thread_ts=ts)
+            say("🤖 *AI analysis:*\n\n{}".format(ai), thread_ts=ts)
         return
     if result.get("is_test_fail"):
-        say("{} ❌ *Revert test failed!* All rolled back\n\n```{}```".format(
-            m, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ❌ *Revert test failed!* (rolled back)\n\n```{}```{}".format(
+            m, get_output_tail(result["output"]), _tips_test_fail(m)), thread_ts=ts)
         _handle_test_or_infra_fail(say, ts, result["output"])
         return
     if result.get("is_push_fail"):
-        say("{} ❌ *Revert push failed!* All local reverts undone\n\n```{}```".format(
-            m, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ❌ *Revert push failed!* All local reverts undone\n\n```{}```{}".format(
+            m, get_output_tail(result["output"]), _tips_push_fail()), thread_ts=ts)
         return
-    say("{} ❌ *Revert failed:*\n\n```{}```".format(m, get_output_tail(result["output"])), thread_ts=ts)
+    say("{} ❌ *Revert failed:*\n\n```{}```\n\n"
+        "💡 Reply `manual` to handle manually, or `cancel 0` to cancel.".format(
+            m, get_output_tail(result["output"])), thread_ts=ts)
 
 
 def handle_test_result(result, task):
@@ -1051,78 +1284,140 @@ def handle_test_result(result, task):
     elapsed = _task_elapsed(task)
     branch = result.get("branch", "unknown")
     if result.get("success"):
-        say("{} ✅ *Test passed!* ({})\n\nBranch: `{}`\n\n```{}```".format(
+        say("{} ✅ *Test passed!* ({})\nBranch: `{}`\n\n```{}```".format(
             m, elapsed, branch, get_output_tail(result["output"], 15)), thread_ts=ts)
     else:
-        say("{} ❌ *Test failed* ({})\n\nBranch: `{}`\n\n```{}```".format(
-            m, elapsed, branch, get_output_tail(result["output"])), thread_ts=ts)
+        say("{} ❌ *Test failed* ({})\nBranch: `{}`\n\n```{}```\n\n"
+            "💡 *Suggestion:*\n"
+            "• Check if this is a flaky test or infra issue\n"
+            "• If branch is already broken, consider `revert` on recent CLs\n"
+            "• Use `run-test` to re-verify after fixing".format(
+                m, elapsed, branch, get_output_tail(result["output"])), thread_ts=ts)
         _handle_test_or_infra_fail(say, ts, result["output"])
 
 
-def process_task(task):
-    task_type = task["type"]
+def _prepare_task(task):
+    """Resolve refs and save HEAD/branch state before execution."""
     say, ts = task["say"], task["ts"]
-    target_branch = task.get("target_branch", "")
-    task_log_path = task["log_file"]
 
-    # Resolve refs now (in worker thread, preserving queue order)
     raw_refs = task.get("raw_refs", [])
     if raw_refs:
         resolved, had_errors = resolve_refs(raw_refs, say, ts)
         if had_errors:
             say("❌ Ref resolution failed, skipping task", thread_ts=ts)
-            return {"success": False, "output": "ref resolution failed"}
+            return False
         task["commits"] = resolved
 
-    commits = task.get("commits", [])
-
     try:
-        save_head = subprocess.run(
+        task["save_head"] = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
         ).stdout.strip()
-        save_branch = subprocess.run(
+        task["save_branch"] = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, cwd=REPO_PATH, timeout=10,
         ).stdout.strip()
     except Exception:
-        save_head, save_branch = "", ""
-    task["save_head"] = save_head
-    task["save_branch"] = save_branch
+        task["save_head"], task["save_branch"] = "", ""
 
-    log.info("[TASK] START type=%s commits=%s branch=%s user=%s(%s) log=%s",
-             task_type, commits, target_branch,
-             task.get("user_name", "?"), task.get("user", "?"), task_log_path)
+    return True
+
+
+def _send_starting_message(task):
+    """Send the 'starting...' message to Slack (once, before any retries)."""
+    say, ts = task["say"], task["ts"]
+    task_type = task["type"]
+    commits = task.get("commits", [])
+    target_branch = task.get("target_branch", "")
 
     if task_type == "test":
         if target_branch:
             say("🧪 Running tests on branch `{}`...".format(target_branch), thread_ts=ts)
         else:
             say("🧪 Running tests on current branch...", thread_ts=ts)
-        result = run_test_only(task_log_path, target_branch)
+    elif task_type == "single":
+        say("🍒 Cherry-Pick: `{}` → `{}`".format(commits[0], target_branch), thread_ts=ts)
+    elif task_type == "batch":
+        say("📦 Batch Cherry-Pick: {} → `{}`".format(
+            ", ".join("`{}`".format(c) for c in commits), target_branch), thread_ts=ts)
+    elif task_type == "step":
+        say("👣 Step Cherry-Pick: {} → `{}`".format(
+            ", ".join("`{}`".format(c) for c in commits), target_branch), thread_ts=ts)
+    elif task_type == "revert":
+        say("⏪ Revert: {} on `{}`".format(
+            ", ".join("`{}`".format(c) for c in commits), target_branch), thread_ts=ts)
+
+
+def _execute_task(task):
+    """Execute the task (cherry-pick/revert/test). Returns result dict."""
+    task_type = task["type"]
+    commits = task.get("commits", [])
+    target_branch = task.get("target_branch", "")
+    task_log_path = task["log_file"]
+
+    if task_type == "test":
+        return run_test_only(task_log_path, target_branch)
+    elif task_type == "single":
+        return run_cherry_pick(commits[0], target_branch, task_log_path)
+    elif task_type == "batch":
+        return run_batch_cherry_pick(commits, target_branch, task_log_path)
+    elif task_type == "step":
+        return run_step_cherry_pick(commits, target_branch, task_log_path)
+    elif task_type == "revert":
+        return run_revert(commits, target_branch, task_log_path)
+    return {"success": False, "output": "unknown type"}
+
+
+def _execute_with_infra_retry(task):
+    """Execute task, auto-retry on infrastructure/auth failures."""
+    say, ts = task["say"], task["ts"]
+
+    result = _execute_task(task)
+
+    for attempt in range(1, MAX_INFRA_RETRIES + 1):
+        if result.get("success") or not _is_infra_failure(result.get("output", "")):
+            break
+        say(":warning: Infra/auth error detected. Auto-retrying in 10s... ({}/{})".format(
+            attempt, MAX_INFRA_RETRIES), thread_ts=ts)
+        time.sleep(10)
+        result = _execute_task(task)
+
+    return result
+
+
+def _report_task_result(task, result):
+    """Dispatch result to the appropriate handler."""
+    task_type = task["type"]
+    if task_type == "test":
         handle_test_result(result, task)
     elif task_type == "single":
-        say("🍒 Starting Cherry-Pick: `{}` → `{}`".format(commits[0], target_branch), thread_ts=ts)
-        result = run_cherry_pick(commits[0], target_branch, task_log_path)
         handle_single_result(result, task)
     elif task_type == "batch":
-        say("📦 Starting Batch Cherry-Pick: {} → `{}`".format(
-            ", ".join("`{}`".format(c) for c in commits), target_branch), thread_ts=ts)
-        result = run_batch_cherry_pick(commits, target_branch, task_log_path)
         handle_batch_result(result, task)
     elif task_type == "step":
-        say("👣 Starting Step Cherry-Pick: {} → `{}`".format(
-            ", ".join("`{}`".format(c) for c in commits), target_branch), thread_ts=ts)
-        result = run_step_cherry_pick(commits, target_branch, task_log_path)
         handle_step_result(result, task)
     elif task_type == "revert":
-        say("⏪ Starting Revert: {} on `{}`".format(
-            ", ".join("`{}`".format(c) for c in commits), target_branch), thread_ts=ts)
-        result = run_revert(commits, target_branch, task_log_path)
         handle_revert_result(result, task)
-    else:
-        say("❌ Unknown task type: {}".format(task_type), thread_ts=ts)
-        result = {"success": False, "output": "unknown type"}
+
+
+def process_task(task):
+    """Full task pipeline: prepare -> start msg -> execute (with retry) -> report."""
+    task_type = task["type"]
+    say, ts = task["say"], task["ts"]
+
+    if not _prepare_task(task):
+        return {"success": False, "output": "preparation failed"}
+
+    commits = task.get("commits", [])
+    target_branch = task.get("target_branch", "")
+
+    log.info("[TASK] START type=%s commits=%s branch=%s user=%s(%s) log=%s",
+             task_type, commits, target_branch,
+             task.get("user_name", "?"), task.get("user", "?"), task.get("log_file", ""))
+
+    _send_starting_message(task)
+    result = _execute_with_infra_retry(task)
+    _report_task_result(task, result)
 
     log.info("[TASK] END type=%s success=%s user=%s",
              task_type, result.get("success", False), task.get("user_name", "?"))
@@ -1132,18 +1427,16 @@ def process_task(task):
 # ======================== Background worker thread ========================
 
 class QueueWorker(threading.Thread):
-    def __init__(self, queue):
+    def __init__(self):
         super().__init__(daemon=True, name="cherry-pick-worker")
-        self.queue = queue
 
     def run(self):
         while True:
-            task = self.queue.get()
+            task = _get_task()
             with state_lock:
                 if task in pending_tasks:
                     pending_tasks.remove(task)
 
-            # Check hold: if this task is the hold target, pause
             if hold_before_ts and task.get("ts") == hold_before_ts:
                 try:
                     mentions = []
@@ -1168,7 +1461,30 @@ class QueueWorker(threading.Thread):
                     task["started_at"] = time.time()
                     task["pid"] = None
 
-                result = process_task(task)
+                say, ts = task["say"], task["ts"]
+                target_branch = task.get("target_branch", "")
+
+                # Branch health check (lightweight, no UT)
+                if target_branch:
+                    health_ok, health_msg = check_branch_health(target_branch)
+                    if not health_ok:
+                        say(":warning: Branch health: {}".format(health_msg), thread_ts=ts)
+
+                if task["type"] == "manual":
+                    self._run_manual_task(task)
+                    result = {"success": True, "output": "manual completed"}
+                else:
+                    result = process_task(task)
+
+                    if result.get("success"):
+                        _post_success_report(task, result)
+                    elif not result.get("success") and \
+                         (result.get("is_conflict") or result.get("is_test_fail")) and \
+                         not _is_infra_failure(result.get("output", "")):
+                        accepted = self._offer_manual_fallback(task)
+                        if accepted:
+                            self._run_manual_mode(task)
+                            result = {"success": True, "output": "manual fallback completed"}
 
                 with state_lock:
                     task["finished_at"] = time.time()
@@ -1186,8 +1502,119 @@ class QueueWorker(threading.Thread):
                     pass
                 with state_lock:
                     current_task = None
-            finally:
-                self.queue.task_done()
+
+    def _run_manual_task(self, task):
+        """Handle a manual queue task: notify, wait for takeover, then wait for done."""
+        say, ts = task["say"], task["ts"]
+        m = _mention(task)
+        target_branch = task.get("target_branch", "")
+        head_before = _get_current_head()
+        task["head_before_manual"] = head_before
+
+        say("{} 🔔 *Your turn!*\n"
+            "Branch: `{}`  |  HEAD: `{}`\n"
+            "Reply `takeover` within *{}min* to claim this slot (anyone can).\n"
+            "No response → auto-skip to next task.".format(
+                m, target_branch, head_before[:12] if head_before else "?",
+                FAILURE_WAIT_TIMEOUT // 60),
+            thread_ts=ts)
+
+        claimed_by = self._wait_for_takeover(task)
+        if claimed_by:
+            self._run_manual_mode(task)
+        else:
+            say("{} :hourglass: No one claimed ({}min). Moving to next task.".format(
+                m, FAILURE_WAIT_TIMEOUT // 60), thread_ts=ts)
+
+    def _offer_manual_fallback(self, task):
+        """After bot failure, offer manual takeover. Returns True if someone claims."""
+        say, ts = task["say"], task["ts"]
+        m = _mention(task)
+
+        say("{} 🔧 *Bot could not complete this task automatically.*\n"
+            "Reply `takeover` within *{}min* to handle it manually (anyone can).\n"
+            "No response → auto-skip to next task.".format(
+                m, FAILURE_WAIT_TIMEOUT // 60),
+            thread_ts=ts)
+
+        claimed_by = self._wait_for_takeover(task)
+        if not claimed_by:
+            say("{} :hourglass: No one claimed ({}min). Moving to next task.".format(
+                m, FAILURE_WAIT_TIMEOUT // 60), thread_ts=ts)
+        return bool(claimed_by)
+
+    def _wait_for_takeover(self, task):
+        """Wait up to FAILURE_WAIT_TIMEOUT for someone to reply 'takeover'. Returns user_id or None."""
+        takeover_event = threading.Event()
+        with state_lock:
+            task["waiting_for_takeover"] = True
+            task["takeover_event"] = takeover_event
+
+        takeover_event.wait(timeout=FAILURE_WAIT_TIMEOUT)
+
+        with state_lock:
+            claimed_by = task.get("takeover_user")
+            task["waiting_for_takeover"] = False
+            task.pop("takeover_event", None)
+
+        if task.get("cancelled"):
+            return None
+
+        return claimed_by
+
+    def _run_manual_mode(self, task):
+        """Wait for user to complete manual work. Auto-extends if remote HEAD changes."""
+        say, ts = task["say"], task["ts"]
+        target_branch = task.get("target_branch", "")
+        takeover_uid = task.get("takeover_user", task.get("user", ""))
+        m = "<@{}>".format(takeover_uid) if takeover_uid else _mention(task)
+
+        task["head_before_manual"] = task.get("head_before_manual") or _get_current_head()
+        last_known_remote = _get_remote_head(target_branch) if target_branch else ""
+
+        done_event = threading.Event()
+        with state_lock:
+            task["manual_mode"] = True
+            task["manual_done_event"] = done_event
+            task["manual_deadline"] = time.time() + MANUAL_TIMEOUT
+
+        POLL_INTERVAL = 30
+        remaining = MANUAL_TIMEOUT
+        while remaining > 0:
+            if done_event.wait(timeout=min(remaining, POLL_INTERVAL)):
+                break
+
+            if target_branch:
+                current_remote = _get_remote_head(target_branch)
+                if current_remote and last_known_remote and current_remote != last_known_remote:
+                    last_known_remote = current_remote
+                    task["manual_deadline"] = time.time() + MANUAL_TIMEOUT
+                    log.info("[MANUAL] remote HEAD changed on %s, auto-extending", target_branch)
+
+            remaining = task.get("manual_deadline", 0) - time.time()
+
+        with state_lock:
+            task["manual_mode"] = False
+            task.pop("manual_done_event", None)
+
+        if task.get("skipped"):
+            say("{} ⏭️ Skipped. Re-queued at the end.".format(m), thread_ts=ts)
+            task["skipped"] = False
+            new_task = _build_task(
+                "manual", [], task.get("target_branch", ""),
+                say, ts, task.get("user", ""))
+            _enqueue(new_task, say, ts)
+            return
+
+        if task.get("cancelled"):
+            return
+
+        if not done_event.is_set():
+            say("{} :hourglass: *Manual mode timed out* ({}min). Moving to next task.".format(
+                m, MANUAL_TIMEOUT // 60), thread_ts=ts)
+            return
+
+        _post_manual_done_report(task)
 
 
 # ======================== Slack event handlers ========================
@@ -1215,17 +1642,21 @@ def _is_process_alive(pid):
 def _task_summary(t):
     """One-line task description."""
     user_name = t.get("user_name", "?")
-    if t["type"] == "test":
+    task_type = t.get("type", "?")
+    if task_type == "test":
         branch = t.get("target_branch", "")
         if branch:
             return "`run-test` on `{}` by {}".format(branch, user_name)
         return "`run-test` by {}".format(user_name)
+    if task_type == "manual":
+        branch = t.get("target_branch", "")
+        return "[manual] `{}` by {}".format(branch, user_name)
     commits = t.get("commits", [])
     raw_refs = t.get("raw_refs", [])
     refs = commits if commits else raw_refs
     shown = ", ".join(c[:10] for c in refs)
     return "`{}` {} → `{}` by {}".format(
-        t["type"], shown, t.get("target_branch", ""), user_name)
+        task_type, shown, t.get("target_branch", ""), user_name)
 
 
 def _parse_refs_and_branch(text):
@@ -1252,25 +1683,36 @@ def build_status_message():
     with state_lock:
         lines = ["*📊 Cherry-Pick Bot Status*\n"]
 
+        if session_default_branch:
+            lines.append("🌿 *Default branch:* `{}`".format(session_default_branch))
+
         if current_task:
             elapsed = time.time() - current_task.get("started_at", time.time())
             pid = current_task.get("pid")
             alive = _is_process_alive(pid)
 
-            status_icon = "🟢" if alive else "🔴"
-            proc_status = "running" if alive else ("not started" if not pid else "ended/error")
+            if current_task.get("manual_mode"):
+                deadline = current_task.get("manual_deadline", 0)
+                remaining = max(0, deadline - time.time())
+                lines.append("▶️ *Current:* {} 🔧 Manual mode (remaining {})".format(
+                    _task_summary(current_task), _fmt_elapsed(remaining)))
+            elif current_task.get("waiting_for_takeover"):
+                lines.append("▶️ *Current:* {} ⏳ Waiting for `takeover`".format(
+                    _task_summary(current_task)))
+            else:
+                status_icon = "🟢" if alive else "🔴"
+                proc_status = "running" if alive else ("not started" if not pid else "ended/error")
+                lines.append("▶️ *Current:* {}".format(_task_summary(current_task)))
+                lines.append("   {} Process: {} (PID: {}, elapsed {})".format(
+                    status_icon, proc_status, pid or "-", _fmt_elapsed(elapsed)))
 
-            lines.append("▶️ *Current task:* {}".format(_task_summary(current_task)))
-            lines.append("   {} Process: {} (PID: {}, elapsed {})".format(
-                status_icon, proc_status, pid or "-", _fmt_elapsed(elapsed)))
-
-            log_path = current_task.get("log_file", "")
-            log_tail = read_task_log_tail(log_path, 10) if log_path else "(no log)"
-            if log_tail and log_tail != "(no log)":
-                lines.append("   📋 *Latest output:*")
-                lines.append("```{}```".format(log_tail))
+                log_path = current_task.get("log_file", "")
+                log_tail = read_task_log_tail(log_path, 10) if log_path else "(no log)"
+                if log_tail and log_tail != "(no log)":
+                    lines.append("   📋 *Latest output:*")
+                    lines.append("```{}```".format(log_tail))
         else:
-            lines.append("▶️ *Current task:* none (idle)")
+            lines.append("▶️ *Current:* none (idle)")
 
         if pending_tasks:
             lines.append("\n⏳ *Queue:* {} task(s) waiting".format(len(pending_tasks)))
@@ -1346,7 +1788,12 @@ def _check_duplicate(task):
     return False
 
 
-def _enqueue(task, say, ts):
+def _resolve_branch(explicit_branch):
+    """Return explicit_branch if given, else session_default_branch."""
+    return explicit_branch or session_default_branch
+
+
+def _enqueue(task, say, ts, urgent=False):
     """Enqueue task + update pending_tasks + reply with queue overview."""
     target_branch = task.get("target_branch", "")
     if target_branch and not target_branch.startswith(BRANCH_PREFIX):
@@ -1354,36 +1801,54 @@ def _enqueue(task, say, ts):
             BRANCH_PREFIX, target_branch), thread_ts=ts)
         return
 
-    if _check_duplicate(task):
+    if task.get("type") != "manual" and _check_duplicate(task):
         say("⚠️ Duplicate: same refs already in queue or running. Skipped.", thread_ts=ts)
         return
 
+    if task.get("type") == "manual":
+        user = task.get("user", "")
+        branch = task.get("target_branch", "")
+        with state_lock:
+            for t in pending_tasks:
+                if t.get("type") == "manual" and t.get("user") == user and t.get("target_branch") == branch:
+                    say("⚠️ You already have a manual queue entry for `{}`. Use `status` to check.".format(
+                        branch), thread_ts=ts)
+                    return
+            if current_task and current_task.get("type") == "manual" and \
+               current_task.get("user") == user and current_task.get("target_branch") == branch:
+                say("⚠️ You are already in manual mode on `{}`.".format(branch), thread_ts=ts)
+                return
+
     with state_lock:
-        pending_tasks.append(task)
+        if urgent:
+            pending_tasks.insert(0, task)
+        else:
+            pending_tasks.append(task)
 
         lines = []
         is_busy = current_task is not None
-        ahead = len(pending_tasks) - 1
+        pos = pending_tasks.index(task) + 1 if task in pending_tasks else len(pending_tasks)
+        ahead = pos - 1
+
+        prefix = "🚨 *Urgent* " if urgent else ""
 
         if is_busy:
             elapsed = time.time() - current_task.get("started_at", time.time())
-            lines.append("📥 Queued: {}".format(_task_summary(task)))
+            lines.append("{}📥 Queued (#{})：{}".format(prefix, pos, _task_summary(task)))
             lines.append("▶️ Running: {} (elapsed {})".format(
                 _task_summary(current_task), _fmt_elapsed(elapsed)))
             if ahead > 0:
-                lines.append("⏳ {} task(s) ahead:".format(ahead))
-                for idx, pt in enumerate(pending_tasks[:-1], 1):
-                    lines.append("  {}. {}".format(idx, _task_summary(pt)))
+                lines.append("⏳ {} task(s) ahead".format(ahead))
         else:
-            lines.append("📥 Received: {}".format(_task_summary(task)))
+            lines.append("{}📥 Received: {}".format(prefix, _task_summary(task)))
 
-    task_queue.put(task)
+    _put_task(task, urgent=urgent)
     say("\n".join(lines), thread_ts=ts)
 
 
 @app.event("app_mention")
 def handle_mention(event, say, logger):
-    global BOT_ID
+    global BOT_ID, session_default_branch
 
     if not BOT_ID:
         get_bot_id()
@@ -1402,34 +1867,136 @@ def handle_mention(event, say, logger):
         clean_text = text.replace("<@{}>".format(BOT_ID), "").strip()
     clean_text = clean_text.replace("`", "")
 
+    lower = clean_text.lower()
+    is_urgent = lower.startswith("urgent ")
+    if is_urgent:
+        clean_text = clean_text[len("urgent "):].strip()
+        lower = clean_text.lower()
+
     # --- status ---
-    if "status" in clean_text.lower():
+    if lower == "status" or lower.startswith("status "):
         say(build_status_message(), thread_ts=ts)
         return
 
     # --- help ---
-    if "help" in clean_text.lower():
+    if lower == "help" or lower.startswith("help "):
         say(
-            "*🤖 Cherry-Pick Bot Commands:*\n\n"
-            "• `cherry-pick <commit|Change-Id> <branch>` — Single cherry-pick\n"
-            "• `batch-cp <ref1,ref2,...> <branch>` — Batch cherry-pick (test once)\n"
-            "• `step-cp <ref1,ref2,...> <branch>` — Step cherry-pick (test each)\n"
-            "• `revert <ref> <branch>` — Revert a single commit\n"
-            "• `batch-revert <ref1,ref2,...> <branch>` — Revert multiple commits\n"
-            "• `run-test [branch]` — Run tests (on specified or current branch)\n"
-            "• `hold <N>` — Pause queue before task #N (tasks before it finish first)\n"
-            "• `continue` — Resume paused queue\n"
-            "• `cancel 0` — Cancel current running task (kills + rollback)\n"
+            "*🤖 Cherry-Pick Bot — Command Reference*\n\n"
+            "*🍒 Cherry-Pick / Revert (automated):*\n"
+            "• `cherry-pick <ref> [branch]` — Single cherry-pick + test + push\n"
+            "• `batch-cp <ref1,ref2,...> [branch]` — Batch cherry-pick, test once after all\n"
+            "• `step-cp <ref1,ref2,...> [branch]` — Step cherry-pick, test each (recommended for multiple CLs)\n"
+            "• `revert <ref> [branch]` — Revert a single commit\n"
+            "• `batch-revert <ref1,ref2,...> [branch]` — Revert multiple commits\n"
+            "• `run-test [branch]` — Run tests only\n\n"
+            "*🔧 Manual Queue:*\n"
+            "• `queue [branch]` — Reserve a spot, bot notifies you when it's your turn\n"
+            "• `takeover` — Claim the current slot (anyone can, not just the original user)\n"
+            "• `done` — Signal manual work is complete (bot detects HEAD changes)\n"
+            "• `skip` — Yield your turn, re-queue at the end\n\n"
+            "*⚡ Queue Control:*\n"
+            "• `urgent <any command>` — Insert at front of queue\n"
+            "• `cancel 0` — Cancel current task (kill + rollback)\n"
             "• `cancel <N>` — Cancel queued task #N\n"
-            "• `status` — Queue status + live output + held tasks\n"
-            "_All commands accept: commit hash, Change-Id (I...), or Gerrit change# (e.g. 766210)_",
+            "• `hold <N>` / `continue` — Pause / resume queue\n"
+            "• `set-branch <branch>` — Set default branch (commands can omit branch after)\n"
+            "• `status` — Queue status + live output\n\n"
+            "_Refs: commit hash, Change-Id (I...), Gerrit change# (e.g. 766210)_\n"
+            "_Branch can be omitted if set-branch is configured_",
             thread_ts=ts,
         )
         return
 
-    # --- cancel <number> (0 = current task, 1+ = queued) ---
-    if "cancel" in clean_text.lower():
-        parts = clean_text.lower().split()
+    # --- takeover (claim current slot — anyone can) ---
+    if lower == "takeover" or lower == "manual":
+        with state_lock:
+            if not current_task:
+                say("❌ No task is currently waiting", thread_ts=ts)
+                return
+            if current_task.get("waiting_for_takeover"):
+                current_task["takeover_user"] = user_id
+                takeover_event = current_task.get("takeover_event")
+                if takeover_event:
+                    takeover_event.set()
+                target_branch = current_task.get("target_branch", "")
+                say("<@{}> 🔧 *Taken over.* Branch `{}` is yours.\n"
+                    "Reply `done` when finished. Timer auto-extends while you push.".format(
+                        user_id, target_branch), thread_ts=ts)
+                return
+            if current_task.get("manual_mode"):
+                say("❌ Someone already took over this task. Wait for them to `done` or `skip`.", thread_ts=ts)
+                return
+            say("❌ Current task is not waiting for takeover", thread_ts=ts)
+        return
+
+    # --- done (manual mode completion) ---
+    if lower == "done":
+        with state_lock:
+            if not current_task:
+                say("❌ No task is currently running", thread_ts=ts)
+                return
+            if current_task.get("manual_mode"):
+                takeover_uid = current_task.get("takeover_user", current_task.get("user", ""))
+                if user_id != takeover_uid:
+                    say("❌ Only the person who took over (<@{}>) can reply `done`.".format(
+                        takeover_uid), thread_ts=ts)
+                    return
+                done_event = current_task.get("manual_done_event")
+                if done_event:
+                    done_event.set()
+                    say("✅ Got it! Generating report...", thread_ts=ts)
+                return
+            say("❌ Current task is not in manual mode", thread_ts=ts)
+        return
+
+    # --- skip (yield manual turn) ---
+    if lower == "skip":
+        with state_lock:
+            if not current_task or not current_task.get("manual_mode"):
+                say("❌ No manual mode task is active", thread_ts=ts)
+                return
+            takeover_uid = current_task.get("takeover_user", current_task.get("user", ""))
+            if user_id != takeover_uid:
+                say("❌ Only <@{}> can skip".format(takeover_uid), thread_ts=ts)
+                return
+            current_task["skipped"] = True
+            done_event = current_task.get("manual_done_event")
+            if done_event:
+                done_event.set()
+        return
+
+    # --- extend [minutes] (hidden fallback, not in help) ---
+    if lower.startswith("extend"):
+        parts = lower.split()
+        extra_minutes = 15
+        if len(parts) > 1 and parts[1].isdigit():
+            extra_minutes = int(parts[1])
+        with state_lock:
+            if not current_task or not current_task.get("manual_mode"):
+                say("❌ No manual mode task is active", thread_ts=ts)
+                return
+            current_task["manual_deadline"] = current_task.get(
+                "manual_deadline", time.time()) + extra_minutes * 60
+            remaining = max(0, current_task["manual_deadline"] - time.time())
+            say(":stopwatch: Extended by {}min. Remaining: {}".format(
+                extra_minutes, _fmt_elapsed(remaining)), thread_ts=ts)
+        return
+
+    # --- set-branch <branch> ---
+    if lower.startswith("set-branch"):
+        parts = clean_text.split()
+        if len(parts) < 2:
+            say("❌ Format: `set-branch <branch>`\nCurrent: `{}`".format(
+                session_default_branch or "(not set)"), thread_ts=ts)
+        else:
+            session_default_branch = parts[1]
+            log.info("[CONFIG] default branch set to %s by %s", session_default_branch, user_name)
+            say("🌿 Default branch set to `{}`".format(session_default_branch), thread_ts=ts)
+        return
+
+    # --- cancel <number> ---
+    if "cancel" in lower:
+        parts = lower.split()
         cancel_idx = None
         for i, p in enumerate(parts):
             if p == "cancel" and i + 1 < len(parts) and parts[i + 1].isdigit():
@@ -1437,16 +2004,34 @@ def handle_mention(event, say, logger):
                 break
 
         if cancel_idx is None:
-            say("❌ Format: `cancel <number>` — 0 for current task, 1+ for queued "
-                "(use `status` to see numbers)", thread_ts=ts)
+            say("❌ Format: `cancel <number>` — 0 for current task, 1+ for queued", thread_ts=ts)
         elif cancel_idx == 0:
+            cancelled_task = None
             with state_lock:
                 if not current_task:
                     say("❌ No task is currently running", thread_ts=ts)
                 else:
-                    pid = current_task.get("pid")
                     cancelled_task = current_task
+                    pid = current_task.get("pid")
                     owner_mention = "<@{}>".format(cancelled_task.get("user", "")) if cancelled_task.get("user") else ""
+
+                    if current_task.get("manual_mode"):
+                        current_task["cancelled"] = True
+                        done_event = current_task.get("manual_done_event")
+                        if done_event:
+                            done_event.set()
+                        say("✅ Cancelled manual mode task: {} {}".format(
+                            _task_summary(cancelled_task), owner_mention).rstrip(), thread_ts=ts)
+                        cancelled_task = None
+
+                    if current_task.get("waiting_for_takeover"):
+                        current_task["cancelled"] = True
+                        takeover_event = current_task.get("takeover_event")
+                        if takeover_event:
+                            takeover_event.set()
+                        say("✅ Cancelled waiting task: {} {}".format(
+                            _task_summary(cancelled_task), owner_mention).rstrip(), thread_ts=ts)
+                        cancelled_task = None
 
             if cancelled_task:
                 log.info("[CANCEL] killing current task pid=%s: %s by %s",
@@ -1461,7 +2046,6 @@ def handle_mention(event, say, logger):
                     except Exception as e:
                         log.warning("[CANCEL] failed to kill pid %d: %s", pid, e)
 
-                # Rollback repo: abort cherry-pick + reset to pre-task HEAD
                 try:
                     subprocess.run(
                         ["git", "cherry-pick", "--abort"],
@@ -1484,7 +2068,6 @@ def handle_mention(event, say, logger):
                             ["git", "reset", "--hard", "HEAD"],
                             capture_output=True, cwd=REPO_PATH, timeout=10,
                         )
-                        log.warning("[CANCEL] no save_head, reset to HEAD (may not fully rollback)")
                     subprocess.run(
                         ["git", "clean", "-fd"],
                         capture_output=True, cwd=REPO_PATH, timeout=10,
@@ -1494,7 +2077,6 @@ def handle_mention(event, say, logger):
                             ["git", "checkout", save_branch],
                             capture_output=True, cwd=REPO_PATH, timeout=10,
                         )
-                        log.info("[CANCEL] switched back to %s", save_branch)
                     log.info("[CANCEL] repo rolled back")
                 except Exception as e:
                     log.warning("[CANCEL] rollback error: %s", e)
@@ -1508,17 +2090,9 @@ def handle_mention(event, say, logger):
                         cancel_idx, len(pending_tasks)), thread_ts=ts)
                 else:
                     removed = pending_tasks.pop(cancel_idx - 1)
-                    new_q = Queue()
-                    while not task_queue.empty():
-                        try:
-                            t = task_queue.get_nowait()
-                            if t is not removed:
-                                new_q.put(t)
-                            task_queue.task_done()
-                        except Exception:
-                            break
-                    while not new_q.empty():
-                        task_queue.put(new_q.get_nowait())
+                    with task_condition:
+                        if removed in task_list:
+                            task_list.remove(removed)
 
                     log.info("[CANCEL] task #%d cancelled: %s by %s",
                              cancel_idx, _task_summary(removed), user_name)
@@ -1528,8 +2102,8 @@ def handle_mention(event, say, logger):
         return
 
     # --- hold <N> ---
-    if "hold" in clean_text.lower() and "continue" not in clean_text.lower():
-        parts = clean_text.lower().split()
+    if "hold" in lower and "continue" not in lower:
+        parts = lower.split()
         hold_idx = None
         for i, p in enumerate(parts):
             if p == "hold" and i + 1 < len(parts) and parts[i + 1].isdigit():
@@ -1552,12 +2126,12 @@ def handle_mention(event, say, logger):
                     log.info("[HOLD] will pause before task #%d: %s requested by %s(%s)",
                              hold_idx, _task_summary(target_task), user_name, user_id)
                     say("⏸️ Queue will pause before task #{}: {}\n"
-                        "Requested by {}. Tasks before it will finish. Use `continue` to resume.".format(
-                            hold_idx, _task_summary(target_task), user_name), thread_ts=ts)
+                        "Use `continue` to resume.".format(
+                            hold_idx, _task_summary(target_task)), thread_ts=ts)
         return
 
     # --- continue ---
-    if "continue" in clean_text.lower():
+    if lower == "continue":
         with state_lock:
             if hold_before_ts is None and hold_event.is_set():
                 say("❌ Queue is not paused", thread_ts=ts)
@@ -1569,49 +2143,72 @@ def handle_mention(event, say, logger):
                 say("▶️ Queue resumed", thread_ts=ts)
         return
 
+    # --- queue [branch] (manual queue) ---
+    if lower == "queue" or lower.startswith("queue "):
+        parts = clean_text.split()
+        branch = parts[1] if len(parts) > 1 else ""
+        branch = _resolve_branch(branch)
+        if not branch:
+            say("❌ Please specify a branch: `queue <branch>`, or use `set-branch` first", thread_ts=ts)
+            return
+        task = _build_task("manual", [], branch, say, ts, user_id)
+        log.info("[QUEUE] type=manual branch=%s user=%s", branch, user_name)
+        _enqueue(task, say, ts, urgent=is_urgent)
+        return
+
     # --- run-test [branch] ---
-    if "run-test" in clean_text.lower():
+    if "run-test" in lower:
         rt_tmp = clean_text.lower().replace("run-test", "", 1).strip()
         rt_branch = rt_tmp.split()[0] if rt_tmp.split() else ""
         if rt_branch:
             rt_branch = clean_text.split()[clean_text.lower().split().index("run-test") + 1]
+        rt_branch = _resolve_branch(rt_branch)
         task = _build_task("test", [], rt_branch, say, ts, user_id)
         log.info("[QUEUE] type=test branch=%s user=%s", rt_branch or "(current)", user_name)
-        _enqueue(task, say, ts)
+        _enqueue(task, say, ts, urgent=is_urgent)
         return
 
     # --- cherry-pick ---
-    if "cherry-pick" in clean_text.lower():
+    if "cherry-pick" in lower:
         parts = clean_text.split()
         cp_idx = None
         for i, p in enumerate(parts):
             if p.lower() in ("cherry-pick", "!cherry-pick"):
                 cp_idx = i
                 break
-        if cp_idx is not None and len(parts) > cp_idx + 2:
+        if cp_idx is not None and len(parts) > cp_idx + 1:
             raw_ref = parts[cp_idx + 1]
-            target_branch = parts[cp_idx + 2]
+            target_branch = parts[cp_idx + 2] if len(parts) > cp_idx + 2 else ""
+            target_branch = _resolve_branch(target_branch)
+
+            if not target_branch:
+                say("❌ Please specify a branch: `cherry-pick <ref> <branch>`, or use `set-branch` first", thread_ts=ts)
+                return
 
             task = _build_task("single", [], target_branch, say, ts, user_id)
             task["raw_refs"] = [raw_ref]
             log.info("[QUEUE] type=single ref=%s branch=%s user=%s",
                      raw_ref, target_branch, user_name)
-            _enqueue(task, say, ts)
+            _enqueue(task, say, ts, urgent=is_urgent)
         else:
             say("❌ Format: `cherry-pick <commit|Change-Id> <branch>`", thread_ts=ts)
         return
 
     # --- revert / batch-revert ---
-    is_revert = "batch-revert" in clean_text.lower() or "revert" in clean_text.lower()
+    is_revert = "batch-revert" in lower or "revert" in lower
     if is_revert:
-        is_batch_revert = "batch-revert" in clean_text.lower()
+        is_batch_revert = "batch-revert" in lower
         tmp = clean_text
         for keyword in ("batch-revert", "revert"):
             tmp = tmp.replace(keyword, "", 1)
         tmp = tmp.strip()
-        parts = tmp.split()
 
         raw_refs, target_branch = _parse_refs_and_branch(tmp)
+        if not target_branch:
+            target_branch = _resolve_branch("")
+        if raw_refs and not target_branch:
+            target_branch = _resolve_branch(raw_refs[-1])
+            raw_refs = raw_refs[:-1] if len(raw_refs) > 1 else raw_refs
 
         if not raw_refs or not target_branch:
             say("❌ Format: `revert <commit> <branch>` or `batch-revert <c1,c2,...> <branch>`",
@@ -1623,12 +2220,12 @@ def handle_mention(event, say, logger):
             task["raw_refs"] = raw_refs
             log.info("[QUEUE] type=revert refs=%s branch=%s user=%s",
                      raw_refs, target_branch, user_name)
-            _enqueue(task, say, ts)
+            _enqueue(task, say, ts, urgent=is_urgent)
         return
 
     # --- batch-cp / step-cp ---
-    is_batch = "batch-cp" in clean_text.lower()
-    is_step = "step-cp" in clean_text.lower()
+    is_batch = "batch-cp" in lower
+    is_step = "step-cp" in lower
 
     if is_batch or is_step:
         task_type = "step" if is_step else "batch"
@@ -1636,9 +2233,10 @@ def handle_mention(event, say, logger):
         for keyword in ("!batch-cp", "batch-cp", "!step-cp", "step-cp"):
             tmp = tmp.replace(keyword, "")
         tmp = tmp.strip()
-        parts = tmp.split()
 
         raw_refs, target_branch = _parse_refs_and_branch(tmp)
+        if not target_branch:
+            target_branch = _resolve_branch("")
 
         if not raw_refs or not target_branch:
             say("❌ Format: `batch-cp <c1,c2,c3> <branch>` or `step-cp <c1,c2,c3> <branch>`",
@@ -1648,7 +2246,7 @@ def handle_mention(event, say, logger):
             task["raw_refs"] = raw_refs
             log.info("[QUEUE] type=%s refs=%s branch=%s user=%s",
                      task_type, raw_refs, target_branch, user_name)
-            _enqueue(task, say, ts)
+            _enqueue(task, say, ts, urgent=is_urgent)
         return
 
     say("🤔 Unrecognized command. Type `help` for available commands.", thread_ts=ts)
@@ -1656,31 +2254,148 @@ def handle_mention(event, say, logger):
 
 # ======================== Startup ========================
 
+import signal as _signal
+
+
+def _detect_launch_mode():
+    """Detect how the bot was launched."""
+    ppid = os.getppid()
+    try:
+        with open("/proc/{}/comm".format(ppid)) as f:
+            parent_name = f.read().strip()
+    except Exception:
+        parent_name = "unknown"
+
+    try:
+        is_nohup = not os.isatty(sys.stdout.fileno())
+    except Exception:
+        is_nohup = True
+    try:
+        id_result = subprocess.run(
+            ["id", "-Gn"], capture_output=True, text=True, timeout=5,
+        )
+        in_docker_group = id_result.returncode == 0 and "docker" in id_result.stdout
+    except Exception:
+        in_docker_group = False
+
+    parts = []
+    parts.append("nohup/background" if is_nohup else "foreground/tty")
+    parts.append("parent={}(pid={})".format(parent_name, ppid))
+    parts.append("docker_group={}".format("yes" if in_docker_group else "NO"))
+    parts.append("pid={}".format(os.getpid()))
+    return ", ".join(parts)
+
+
+PID_FILE = os.path.join(BOT_DIR, "bot.pid")
+NOTIFY_CHANNEL = os.environ.get("NOTIFY_CHANNEL", "")
+
+
+def _dm_admins(message):
+    """Send a DM to each admin user. Slack: posting to a user_id opens a DM."""
+    for uid in ADMIN_USER_IDS:
+        try:
+            app.client.chat_postMessage(channel=uid, text=message)
+            log.info("[DM] sent to %s", uid)
+        except Exception as e:
+            log.warning("[DM] failed to DM %s: %s", uid, e)
+
+
+def _notify_startup(launch_mode):
+    """Notify admins (via DM) and optionally a channel on startup."""
+    msg = (":robot_face: *Cherry-Pick Bot started*\n"
+           "Launch: {}\n"
+           "PID: {}\n"
+           "Repo: `{}`\n"
+           "Queue was cleared on restart.").format(launch_mode, os.getpid(), REPO_PATH)
+    _dm_admins(msg)
+    if NOTIFY_CHANNEL:
+        try:
+            app.client.chat_postMessage(channel=NOTIFY_CHANNEL, text=msg)
+        except Exception as e:
+            log.warning("[NOTIFY] failed to post to %s: %s", NOTIFY_CHANNEL, e)
+
+
+def _notify_shutdown(reason="signal"):
+    """Notify admins on shutdown."""
+    with state_lock:
+        n_pending = len(pending_tasks)
+        has_current = current_task is not None
+    parts = [":warning: *Cherry-Pick Bot shutting down* ({})".format(reason)]
+    if has_current:
+        parts.append("Current task was interrupted.")
+    if n_pending:
+        parts.append("{} queued task(s) will be lost.".format(n_pending))
+    _dm_admins("\n".join(parts))
+
+
+def _write_pid():
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        log.warning("Could not write PID file: %s", e)
+
+
+def _remove_pid():
+    try:
+        os.remove(PID_FILE)
+    except Exception:
+        pass
+
+
+def _shutdown_handler(signum, frame):
+    sig_name = _signal.Signals(signum).name if hasattr(_signal, "Signals") else str(signum)
+    log.warning("[SHUTDOWN] received signal %s (%d) — bot shutting down", sig_name, signum)
+    try:
+        _notify_shutdown("signal {}".format(sig_name))
+    except Exception:
+        pass
+    _remove_pid()
+    sys.exit(0)
+
+
+def _sighup_handler(signum, frame):
+    log.info("[SIGNAL] received SIGHUP (SSH disconnect?) — ignoring, bot continues")
+
+
 if __name__ == "__main__":
+    _signal.signal(_signal.SIGHUP, _sighup_handler)
+    for sig in (_signal.SIGTERM, _signal.SIGINT):
+        _signal.signal(sig, _shutdown_handler)
+
     if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
         log.error("Missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN")
         sys.exit(1)
 
     validate_repo_path()
+    _write_pid()
 
     bot_id = get_bot_id()
 
-    worker = QueueWorker(task_queue)
+    worker = QueueWorker()
     worker.start()
 
     cleaner = LogCleaner(TASK_LOG_DIR, LOG_RETAIN_HOURS)
     cleaner.start()
 
+    launch_mode = _detect_launch_mode()
+
     log.info("=" * 50)
     log.info("Slack Cherry-Pick Bot started")
+    log.info("  Launch: %s", launch_mode)
     log.info("  Bot ID: %s", bot_id)
     log.info("  Repo: %s", REPO_PATH)
     log.info("  Test: %s", TEST_COMMAND[:80])
     log.info("  Shell Init: %s", SHELL_INIT)
     log.info("  Timeout: %ds", TEST_TIMEOUT)
+    log.info("  Manual timeout: %ds", MANUAL_TIMEOUT)
+    log.info("  Failure wait: %ds", FAILURE_WAIT_TIMEOUT)
+    log.info("  Infra retries: %d", MAX_INFRA_RETRIES)
     log.info("  Log dir: %s", LOG_DIR)
     log.info("  Log retain: %dh", LOG_RETAIN_HOURS)
     log.info("=" * 50)
+
+    _notify_startup(launch_mode)
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()

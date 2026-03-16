@@ -6,9 +6,9 @@ import glob
 import os
 import sys
 import tempfile
+import threading
 import time
 from collections import OrderedDict
-from queue import Queue
 
 import pytest
 
@@ -228,101 +228,92 @@ class TestCancelQueue:
     def test_cancel_middle_task(self):
         """Cancel task #2 out of 3 pending tasks."""
         original_pending = sl.pending_tasks[:]
-        original_queue = sl.task_queue
+        original_list = sl.task_list[:]
 
         sl.pending_tasks = []
-        sl.task_queue = Queue()
+        with sl.task_condition:
+            sl.task_list.clear()
 
         t1 = self._make_task(commits=["aaa"])
         t2 = self._make_task(commits=["bbb"])
         t3 = self._make_task(commits=["ccc"])
         sl.pending_tasks = [t1, t2, t3]
-        sl.task_queue.put(t1)
-        sl.task_queue.put(t2)
-        sl.task_queue.put(t3)
+        sl._put_task(t1)
+        sl._put_task(t2)
+        sl._put_task(t3)
 
         try:
             with sl.state_lock:
-                removed = sl.pending_tasks.pop(1)  # remove #2
-                new_q = Queue()
-                while not sl.task_queue.empty():
-                    t = sl.task_queue.get_nowait()
-                    if t is not removed:
-                        new_q.put(t)
-                    sl.task_queue.task_done()
-                while not new_q.empty():
-                    sl.task_queue.put(new_q.get_nowait())
+                removed = sl.pending_tasks.pop(1)
+                with sl.task_condition:
+                    if removed in sl.task_list:
+                        sl.task_list.remove(removed)
 
             assert len(sl.pending_tasks) == 2
             assert sl.pending_tasks[0] is t1
             assert sl.pending_tasks[1] is t3
-            assert sl.task_queue.qsize() == 2
+            assert len(sl.task_list) == 2
         finally:
             sl.pending_tasks = original_pending
-            sl.task_queue = original_queue
+            with sl.task_condition:
+                sl.task_list[:] = original_list
 
     def test_cancel_first_task(self):
         """Cancel task #1."""
         original_pending = sl.pending_tasks[:]
-        original_queue = sl.task_queue
+        original_list = sl.task_list[:]
 
         sl.pending_tasks = []
-        sl.task_queue = Queue()
+        with sl.task_condition:
+            sl.task_list.clear()
 
         t1 = self._make_task(commits=["aaa"])
         t2 = self._make_task(commits=["bbb"])
         sl.pending_tasks = [t1, t2]
-        sl.task_queue.put(t1)
-        sl.task_queue.put(t2)
+        sl._put_task(t1)
+        sl._put_task(t2)
 
         try:
             with sl.state_lock:
                 removed = sl.pending_tasks.pop(0)
-                new_q = Queue()
-                while not sl.task_queue.empty():
-                    t = sl.task_queue.get_nowait()
-                    if t is not removed:
-                        new_q.put(t)
-                    sl.task_queue.task_done()
-                while not new_q.empty():
-                    sl.task_queue.put(new_q.get_nowait())
+                with sl.task_condition:
+                    if removed in sl.task_list:
+                        sl.task_list.remove(removed)
 
             assert len(sl.pending_tasks) == 1
             assert sl.pending_tasks[0] is t2
-            assert sl.task_queue.qsize() == 1
+            assert len(sl.task_list) == 1
         finally:
             sl.pending_tasks = original_pending
-            sl.task_queue = original_queue
+            with sl.task_condition:
+                sl.task_list[:] = original_list
 
     def test_cancel_only_task(self):
         """Cancel the only task in queue."""
         original_pending = sl.pending_tasks[:]
-        original_queue = sl.task_queue
+        original_list = sl.task_list[:]
 
         sl.pending_tasks = []
-        sl.task_queue = Queue()
+        with sl.task_condition:
+            sl.task_list.clear()
 
         t1 = self._make_task(commits=["aaa"])
         sl.pending_tasks = [t1]
-        sl.task_queue.put(t1)
+        sl._put_task(t1)
 
         try:
             with sl.state_lock:
                 removed = sl.pending_tasks.pop(0)
-                new_q = Queue()
-                while not sl.task_queue.empty():
-                    t = sl.task_queue.get_nowait()
-                    if t is not removed:
-                        new_q.put(t)
-                    sl.task_queue.task_done()
-                while not new_q.empty():
-                    sl.task_queue.put(new_q.get_nowait())
+                with sl.task_condition:
+                    if removed in sl.task_list:
+                        sl.task_list.remove(removed)
 
             assert len(sl.pending_tasks) == 0
-            assert sl.task_queue.qsize() == 0
+            assert len(sl.task_list) == 0
         finally:
             sl.pending_tasks = original_pending
-            sl.task_queue = original_queue
+            with sl.task_condition:
+                sl.task_list[:] = original_list
 
 
 class TestCancelRollback:

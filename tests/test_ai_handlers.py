@@ -50,7 +50,7 @@ class TestSingleAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 1, "Should send AI suggestion for conflict"
         assert "keep both changes" in str(ai_msg[0])
 
@@ -65,7 +65,7 @@ class TestSingleAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 0, "Should not send AI message when analyze returns None"
 
     @patch("slack_listener.analyze_test_failure", return_value="Fix: check import path")
@@ -79,7 +79,7 @@ class TestSingleAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 1
         assert "check import path" in str(ai_msg[0])
 
@@ -94,7 +94,7 @@ class TestSingleAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 0
 
 
@@ -112,7 +112,7 @@ class TestBatchAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 1, "Batch conflict should trigger AI suggestion"
         assert "rebase and retry" in str(ai_msg[0])
 
@@ -127,7 +127,7 @@ class TestBatchAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 0
 
     @patch("slack_listener.analyze_test_failure", return_value="Batch test fix suggestion")
@@ -141,7 +141,7 @@ class TestBatchAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 1
 
 
@@ -164,7 +164,7 @@ class TestStepAI:
         mock_conflict_ai.assert_called_once()
         mock_test_ai.assert_not_called()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI conflict suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 1
 
     @patch("slack_listener.analyze_conflict", return_value=None)
@@ -183,7 +183,7 @@ class TestStepAI:
         mock_conflict_ai.assert_not_called()
         mock_test_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 1
 
     @patch("slack_listener.analyze_conflict", return_value="Conflict fix advice")
@@ -203,10 +203,8 @@ class TestStepAI:
         mock_conflict_ai.assert_called_once()
         mock_test_ai.assert_called_once()
         calls = task["say"].call_args_list
-        conflict_msg = [c for c in calls if "AI conflict suggestion" in str(c)]
-        test_msg = [c for c in calls if "AI suggestion" in str(c) and "conflict" not in str(c).lower()]
-        assert len(conflict_msg) == 1
-        assert len(test_msg) == 1
+        ai_msgs = [c for c in calls if "AI analysis" in str(c)]
+        assert len(ai_msgs) == 2, "Both conflict and test-fail AI analyses should fire"
 
     @patch("slack_listener.analyze_conflict", return_value="All-fail conflict advice")
     @patch("slack_listener.analyze_test_failure", return_value="All-fail test advice")
@@ -239,7 +237,7 @@ class TestRunTestAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 1
 
     @patch("slack_listener.analyze_test_failure", return_value=None)
@@ -252,7 +250,7 @@ class TestRunTestAI:
 
         mock_ai.assert_called_once()
         calls = task["say"].call_args_list
-        ai_msg = [c for c in calls if "AI suggestion" in str(c)]
+        ai_msg = [c for c in calls if "AI analysis" in str(c)]
         assert len(ai_msg) == 0
 
     def test_success_no_ai(self, mock_task):
